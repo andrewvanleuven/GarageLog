@@ -1,32 +1,38 @@
-//
-//  GarageLogApp.swift
-//  GarageLog
-//
-//  Created by Andrew Van Leuven on 4/17/26.
-//
-
 import SwiftUI
 import SwiftData
 
 @main
 struct GarageLogApp: App {
-    var sharedModelContainer: ModelContainer = {
-        let schema = Schema([
-            Item.self,
-        ])
-        let modelConfiguration = ModelConfiguration(schema: schema, isStoredInMemoryOnly: false)
+    @Environment(\.scenePhase) private var scenePhase
+    @AppStorage("logReminderDays") private var logReminderDays: Int = 15
 
-        do {
-            return try ModelContainer(for: schema, configurations: [modelConfiguration])
-        } catch {
-            fatalError("Could not create ModelContainer: \(error)")
-        }
-    }()
+    init() {
+        NotificationManager.shared.requestPermission()
+    }
 
     var body: some Scene {
         WindowGroup {
             ContentView()
+                #if os(macOS)
+                .frame(minWidth: 820, minHeight: 500)
+                #endif
         }
-        .modelContainer(sharedModelContainer)
+        .modelContainer(for: [
+            Vehicle.self,
+            MaintenanceLog.self,
+            MaintenanceReminder.self,
+            GasFillup.self
+        ])
+        .onChange(of: scenePhase) { _, newPhase in
+            if newPhase == .active {
+                NotificationManager.shared.scheduleLogReminder(daysFromNow: logReminderDays)
+            }
+        }
+
+        #if os(macOS)
+        Settings {
+            SettingsView()
+        }
+        #endif
     }
 }

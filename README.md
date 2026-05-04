@@ -44,7 +44,7 @@ GarageLog is a SwiftUI app for keeping track of every vehicle you own — mainte
 **CSV Import / Export**
 - Export logs or schedule for any vehicle to a shareable CSV
 - Import logs or a full maintenance schedule from CSV (accepts multiple date formats)
-- Template exports designed for LLM-assisted data entry
+- Template exports for bulk data entry assistance
 
 **Notifications**
 - Mileage-based alerts when a service is ≤500 miles away or overdue

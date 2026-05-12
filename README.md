@@ -10,7 +10,7 @@
 
 ---
 
-GarageLog is a SwiftUI app for keeping track of every vehicle you own — maintenance history, upcoming service reminders, fuel economy, and lifetime costs — all in one place. Built for personal use, ${{\color{RedOrange}\Huge{\textsf{vibe-coded\ using\ Claude \}}}}\$ 
+GarageLog is a SwiftUI app for keeping track of every vehicle you own — maintenance history, upcoming service reminders, fuel economy, and lifetime costs — all in one place. Built for personal use, with programming assistance from `Claude Code`.
 
 ## Features
 

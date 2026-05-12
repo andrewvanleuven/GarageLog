@@ -5,6 +5,27 @@ struct VehicleStatsView: View {
     let vehicle: Vehicle
     @AppStorage("accentColorName") private var accentColorName: String = "blue"
     @AppStorage("isDarkMode") private var isDarkMode: Bool = true
+    @State private var mileageRange: MileageRange = .lifetime
+
+    enum MileageRange: CaseIterable {
+        case threeMonths, sixMonths, twelveMonths, lifetime
+        var label: String {
+            switch self {
+            case .threeMonths: return "3mo"
+            case .sixMonths: return "6mo"
+            case .twelveMonths: return "12mo"
+            case .lifetime: return "Lifetime"
+            }
+        }
+        var months: Int? {
+            switch self {
+            case .threeMonths: return 3
+            case .sixMonths: return 6
+            case .twelveMonths: return 12
+            case .lifetime: return nil
+            }
+        }
+    }
 
     struct MileagePoint: Identifiable {
         let id = UUID()
@@ -22,10 +43,16 @@ struct VehicleStatsView: View {
         return totalSpend / Double(vehicle.currentMileage)
     }
 
-    private var mileagePoints: [MileagePoint] {
+    private var allMileagePoints: [MileagePoint] {
         var pts = vehicle.maintenanceLogs.map { MileagePoint(date: $0.date, mileage: $0.mileage) }
         pts += vehicle.gasFillups.map { MileagePoint(date: $0.date, mileage: $0.mileage) }
         return pts.sorted { $0.date < $1.date }
+    }
+
+    private var mileagePoints: [MileagePoint] {
+        guard let months = mileageRange.months else { return allMileagePoints }
+        let cutoff = Calendar.current.date(byAdding: .month, value: -months, to: Date()) ?? Date()
+        return allMileagePoints.filter { $0.date >= cutoff }
     }
 
     var body: some View {
@@ -44,20 +71,15 @@ struct VehicleStatsView: View {
                 }
             }
 
-            if mileagePoints.count >= 2 {
+            if allMileagePoints.count >= 2 {
                 Section("Mileage Over Time") {
-                    Chart(mileagePoints) { pt in
+                    let visiblePoints = mileagePoints.count >= 2 ? mileagePoints : allMileagePoints
+                    Chart(visiblePoints) { pt in
                         LineMark(
                             x: .value("Date", pt.date),
                             y: .value("Miles", pt.mileage)
                         )
                         .foregroundStyle(accent)
-                        PointMark(
-                            x: .value("Date", pt.date),
-                            y: .value("Miles", pt.mileage)
-                        )
-                        .foregroundStyle(accent)
-                        .symbolSize(25)
                     }
                     .frame(height: 220)
                     .chartXAxis {
@@ -67,6 +89,22 @@ struct VehicleStatsView: View {
                         }
                     }
                     .padding(.vertical, 8)
+                    .overlay(alignment: .topTrailing) {
+                        Text(mileageRange.label)
+                            .font(.caption.weight(.semibold))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 8)
+                            .padding(.vertical, 4)
+                            .background(.regularMaterial, in: Capsule())
+                            .padding([.top, .trailing], 12)
+                            .allowsHitTesting(false)
+                    }
+                    .contentShape(Rectangle())
+                    .onTapGesture {
+                        let all = MileageRange.allCases
+                        let idx = all.firstIndex(of: mileageRange)!
+                        mileageRange = all[(idx + 1) % all.count]
+                    }
                 }
             }
         }

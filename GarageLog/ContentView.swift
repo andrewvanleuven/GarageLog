@@ -17,6 +17,7 @@ struct ContentView: View {
     @AppStorage("customAccentColorHex") private var customAccentColorHex: String = ""
     @AppStorage("isDarkMode") private var isDarkMode: Bool = true
     @AppStorage("gasFillupEnabled") private var gasFillupEnabled: Bool = true
+    @AppStorage("showNextUpBulletin") private var showNextUpBulletin: Bool = true
 
     enum SortType: String {
         case lastModified, nameAZ, customOrder
@@ -152,6 +153,9 @@ struct ContentView: View {
                     }
                 } else {
                     ScrollView {
+                        if showNextUpBulletin {
+                            NextUpSection(vehicles: sortedVehicles)
+                        }
                         LazyVGrid(columns: columns, spacing: 20) {
                             ForEach(sortedVehicles) { vehicle in
                                 NavigationLink {
@@ -554,6 +558,152 @@ struct AllCapsTextField: UIViewRepresentable {
             onReturn?()
             return true
         }
+    }
+}
+#endif
+
+// MARK: - Next Up Section
+
+#if os(iOS)
+struct NextUpSection: View {
+    let vehicles: [Vehicle]
+    @AppStorage("accentColorName") private var accentColorName: String = "blue"
+
+    fileprivate struct DueItem: Identifiable {
+        let id = UUID()
+        let vehicle: Vehicle
+        let reminder: MaintenanceReminder
+        let urgency: Int
+    }
+
+    private var dueItems: [DueItem] {
+        var items: [DueItem] = []
+        for v in vehicles {
+            for r in v.reminders {
+                let val = reminderMilesUntilDue(r, currentMileage: v.currentMileage)
+                if val == -999_999 { continue } // time reminder, never completed — sort sentinel only
+                let threshold: Int = r.intervalType == .mileage ? 500 : 3000
+                if val <= threshold {
+                    items.append(DueItem(vehicle: v, reminder: r, urgency: val))
+                }
+            }
+        }
+        // Genuinely overdue/due-soon first, then untracked (never-logged mileage reminders)
+        return items.sorted { a, b in
+            let aUntracked = a.reminder.intervalType == .mileage && a.reminder.lastCompletedMileage == nil && a.reminder.nextReminderMileage == nil
+            let bUntracked = b.reminder.intervalType == .mileage && b.reminder.lastCompletedMileage == nil && b.reminder.nextReminderMileage == nil
+            if aUntracked != bUntracked { return !aUntracked }
+            return a.urgency < b.urgency
+        }
+    }
+
+    private func isUntracked(_ item: DueItem) -> Bool {
+        item.reminder.intervalType == .mileage
+            && item.reminder.lastCompletedMileage == nil
+            && item.reminder.nextReminderMileage == nil
+    }
+
+    private func statusText(_ item: DueItem) -> String {
+        if isUntracked(item) { return "Not yet logged" }
+        let val = item.urgency
+        if val <= 0 {
+            let over = -val
+            if item.reminder.intervalType == .mileage {
+                return over == 0 ? "Due now" : "\(over) \(item.vehicle.mileageUnit.label) overdue"
+            } else {
+                return "Overdue"
+            }
+        }
+        switch item.reminder.intervalType {
+        case .mileage:
+            return "in \(val) \(item.vehicle.mileageUnit.label)"
+        case .time:
+            if let nextDate = item.reminder.nextReminderDate {
+                let days = Calendar.current.dateComponents([.day], from: Date(), to: nextDate).day ?? 0
+                return days <= 0 ? "Today" : "in \(days) day\(days == 1 ? "" : "s")"
+            }
+            let months = max(0, val / 1000)
+            return months == 0 ? "This month" : "in \(months) mo"
+        }
+    }
+
+    private func cardColor(_ item: DueItem) -> Color {
+        if isUntracked(item) { return Color.fromName(accentColorName) }
+        if item.urgency <= 0 { return .red }
+        if item.reminder.intervalType == .mileage && item.urgency <= 100 { return .orange }
+        if item.reminder.intervalType == .time && item.urgency <= 1000 { return .orange }
+        return Color.fromName(accentColorName)
+    }
+
+    var body: some View {
+        if dueItems.isEmpty { EmptyView() } else {
+            VStack(alignment: .leading, spacing: 8) {
+                HStack {
+                    Label("Next Up", systemImage: "wrench.and.screwdriver.fill")
+                        .font(.headline)
+                        .foregroundStyle(Color.fromName(accentColorName))
+                    Spacer()
+                    Text("\(dueItems.count) item\(dueItems.count == 1 ? "" : "s")")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                .padding(.horizontal)
+                .padding(.top, 8)
+
+                ScrollView(.horizontal, showsIndicators: false) {
+                    HStack(spacing: 12) {
+                        ForEach(dueItems) { item in
+                            NavigationLink {
+                                VehicleDetailView(vehicle: item.vehicle)
+                            } label: {
+                                NextUpCard(item: item, statusText: statusText(item), statusColor: cardColor(item), borderColor: Color.fromName(accentColorName))
+                            }
+                            .buttonStyle(PlainButtonStyle())
+                        }
+                    }
+                    .padding(.horizontal)
+                    .padding(.bottom, 4)
+                }
+            }
+            .padding(.bottom, 4)
+        }
+    }
+}
+
+private struct NextUpCard: View {
+    let item: NextUpSection.DueItem
+    let statusText: String
+    let statusColor: Color
+    let borderColor: Color
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(item.vehicle.displayName)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .lineLimit(1)
+            Text(item.reminder.title)
+                .font(.subheadline.weight(.semibold))
+                .foregroundStyle(.primary)
+                .lineLimit(2)
+            Spacer(minLength: 0)
+            HStack(spacing: 4) {
+                Circle()
+                    .fill(statusColor)
+                    .frame(width: 7, height: 7)
+                Text(statusText)
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(statusColor)
+            }
+        }
+        .padding(14)
+        .frame(width: 150, height: 100, alignment: .topLeading)
+        .background(.regularMaterial)
+        .clipShape(RoundedRectangle(cornerRadius: 14))
+        .overlay(
+            RoundedRectangle(cornerRadius: 14)
+                .stroke(borderColor.opacity(0.3), lineWidth: 1)
+        )
     }
 }
 #endif

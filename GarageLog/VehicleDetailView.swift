@@ -9,11 +9,12 @@ struct CSVReport: Transferable {
     let content: String
     
     static var transferRepresentation: some TransferRepresentation {
-        DataRepresentation(exportedContentType: .commaSeparatedText) { report in
-            report.content.data(using: .utf8) ?? Data()
-        }
-        .suggestedFileName { report in
-            "\(report.name)_Maintenance.csv"
+        FileRepresentation(exportedContentType: .commaSeparatedText) { report in
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent(report.name)
+                .appendingPathExtension("csv")
+            try (report.content.data(using: .utf8) ?? Data()).write(to: url)
+            return SentTransferredFile(url)
         }
     }
 }
@@ -44,13 +45,12 @@ struct VehicleDetailView: View {
     @State private var showingClearSchedule = false
     @State private var showingScheduleSettings = false
     @State private var reminderToEdit: MaintenanceReminder?
-    @State private var reminderToSkip: MaintenanceReminder?
-    @State private var skipMileageString = ""
-    private enum ImportType { case logs, schedule }
+    @State private var reminderToSetNext: MaintenanceReminder?
     @State private var showingFileImporter = false
-    @State private var pendingImport: ImportType = .logs
     @State private var importResultMessage = ""
     @State private var showingImportResult = false
+    @State private var pendingImportURL: URL?
+    @State private var showingImportModeDialog = false
     
     // Editable vehicle state
     @State private var editName: String = ""
@@ -62,6 +62,7 @@ struct VehicleDetailView: View {
     @State private var selectedItem: PhotosPickerItem?
     @State private var editImageData: Data?
     @State private var editGasFillupDisabled: Bool = false
+    @State private var editMileageUnit: MileageUnit = .miles
 
     private enum EditField: Hashable { case name, make, model }
     @FocusState private var editFocus: EditField?
@@ -165,35 +166,12 @@ struct VehicleDetailView: View {
         }
     }
 
-    private var csvReport: CSVReport {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateStyle = .short
-        var entries: [(date: Date, row: String)] = []
-
-        for log in vehicle.maintenanceLogs {
-            let notes = log.notes.replacingOccurrences(of: "\"", with: "\"\"")
-            let service = log.serviceType.replacingOccurrences(of: "\"", with: "\"\"")
-            entries.append((log.date, "\(dateFormatter.string(from: log.date)),\"\(service)\",\(log.mileage),,\(log.partsCost),\(log.laborCost),\(log.totalCost),\"\(notes)\"\n"))
-        }
-        for fillup in vehicle.gasFillups {
-            entries.append((fillup.date, "\(dateFormatter.string(from: fillup.date)),\"Gas Fill-up\",\(fillup.mileage),\(String(format: "%.3f", fillup.gallons)),,,\(String(format: "%.2f", fillup.totalCost)),\"\"\n"))
-        }
-
-        entries.sort { $0.date > $1.date }
-        let csvString = "Date,Type,Mileage,Gallons,Parts Cost,Labor Cost,Total Cost,Notes\n"
-            + entries.map { $0.row }.joined()
-        return CSVReport(name: vehicle.displayName, content: csvString)
-    }
-
-    private var scheduleCSVReport: CSVReport {
-        var csvString = "Title,Interval Type,Frequency,Mileage Interval,Month Interval,Notes\n"
-        for reminder in vehicle.reminders {
-            let title = reminder.title.replacingOccurrences(of: "\"", with: "\"\"")
-            let notes = reminder.notes.replacingOccurrences(of: "\"", with: "\"\"")
-            let row = "\"\(title)\",\(reminder.intervalType.rawValue),\(reminder.timeFrequency?.rawValue ?? ""),\(reminder.mileageInterval ?? 0),\(reminder.monthInterval ?? 0),\"\(notes)\"\n"
-            csvString.append(row)
-        }
-        return CSVReport(name: "\(vehicle.displayName)_Schedule", content: csvString)
+    private var vehicleBackupCSV: CSVReport {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "M/d/yy"
+        let content = garageCSVHeader() + vehicleCSVRows(vehicle, using: df)
+        return CSVReport(name: "\(vehicle.displayName)_Backup", content: content)
     }
 
     var body: some View {
@@ -263,6 +241,12 @@ struct VehicleDetailView: View {
                         Toggle("Track Gas Fill-ups", isOn: Binding(get: { !editGasFillupDisabled }, set: { editGasFillupDisabled = !$0 }))
                     }
 
+                    Picker("Mileage Unit", selection: $editMileageUnit) {
+                        Text("Miles (Odometer)").tag(MileageUnit.miles)
+                        Text("Hours (Hour Meter)").tag(MileageUnit.hours)
+                        Text("None (Time-Only)").tag(MileageUnit.none)
+                    }
+
                     Button("Save Changes") {
                         saveVehicleChanges()
                         isEditingVehicle = false
@@ -288,9 +272,13 @@ struct VehicleDetailView: View {
                 Text("Vehicle Info")
             }
             
-            Section {
-                OdometerView(mileage: $vehicle.currentMileage, accentColor: Color.fromName(accentColorName))
-                    .listRowBackground(Color.clear)
+            if vehicle.mileageUnit.tracksMileage {
+                Section {
+                    OdometerView(mileage: $vehicle.currentMileage,
+                                 accentColor: Color.fromName(accentColorName),
+                                 unitLabel: vehicle.mileageUnit.label)
+                        .listRowBackground(Color.clear)
+                }
             }
 
             if fillupActiveForVehicle {
@@ -521,11 +509,14 @@ struct VehicleDetailView: View {
                         ReminderRow(
                             reminder: reminder,
                             currentMileage: vehicle.currentMileage,
+                            unitLabel: vehicle.mileageUnit.label,
                             onComplete: {
                                 logToPrepopulate = reminder.title
                                 showingAddLog = true
                                 reminder.lastCompletedDate = Date()
                                 reminder.lastCompletedMileage = vehicle.currentMileage
+                                reminder.nextReminderMileage = nil
+                                reminder.nextReminderDate = nil
                             },
                             onEdit: {
                                 reminderToEdit = reminder
@@ -550,15 +541,12 @@ struct VehicleDetailView: View {
                             .tint(.orange)
                         }
                         .swipeActions(edge: .leading) {
-                            if reminder.intervalType == .mileage, let interval = reminder.mileageInterval {
-                                Button {
-                                    skipMileageString = "\(vehicle.currentMileage + interval)"
-                                    reminderToSkip = reminder
-                                } label: {
-                                    Label("Skip", systemImage: "forward.circle")
-                                }
-                                .tint(.blue)
+                            Button {
+                                reminderToSetNext = reminder
+                            } label: {
+                                Label("Set Next", systemImage: "pin")
                             }
+                            .tint(.blue)
                         }
                     }
 
@@ -677,28 +665,25 @@ struct VehicleDetailView: View {
             
             Section {
                 Menu {
-                    ShareLink(item: csvReport, preview: SharePreview("\(vehicle.displayName) Maintenance.csv", image: Image(systemName: "tablecells"))) {
-                        Label("Export Logs", systemImage: "doc.text")
-                    }
-                    ShareLink(item: scheduleCSVReport, preview: SharePreview("\(vehicle.displayName) Schedule.csv", image: Image(systemName: "calendar"))) {
-                        Label("Export Schedule", systemImage: "calendar")
+                    ShareLink(item: vehicleBackupCSV, preview: SharePreview("\(vehicle.displayName) Backup.csv", image: Image(systemName: "tablecells"))) {
+                        Label("Export Vehicle Backup", systemImage: "square.and.arrow.up")
                     }
                     Divider()
                     Button {
-                        pendingImport = .logs
                         showingFileImporter = true
                     } label: {
-                        Label("Import Logs", systemImage: "square.and.arrow.down")
-                    }
-                    Button {
-                        pendingImport = .schedule
-                        showingFileImporter = true
-                    } label: {
-                        Label("Import Schedule", systemImage: "square.and.arrow.down")
+                        Label("Import Vehicle Backup", systemImage: "square.and.arrow.down")
                     }
                 } label: {
-                    Label("Import / Export CSV", systemImage: "arrow.up.arrow.down")
+                    Label("Import / Export", systemImage: "arrow.up.arrow.down")
                 }
+                #if os(iOS)
+                if let pdfData = generateVehiclePDF(vehicle: vehicle) {
+                    ShareLink(item: pdfData, preview: SharePreview("\(vehicle.displayName) Report.pdf", image: Image(systemName: "doc.richtext"))) {
+                        Label("Export PDF Report", systemImage: "doc.richtext")
+                    }
+                }
+                #endif
             } header: {
                 Text("Data")
             }
@@ -721,6 +706,9 @@ struct VehicleDetailView: View {
         }
         .sheet(item: $reminderToEdit, onDismiss: refreshNotifications) { reminder in
             AddReminderView(vehicle: vehicle, editingReminder: reminder)
+        }
+        .sheet(item: $reminderToSetNext, onDismiss: refreshNotifications) { reminder in
+            SetNextReminderSheet(reminder: reminder, currentMileage: vehicle.currentMileage, unitLabel: vehicle.mileageUnit.label)
         }
         .sheet(isPresented: $showingClearSchedule) {
             ClearScheduleSheet {
@@ -779,38 +767,28 @@ struct VehicleDetailView: View {
         ) { result in
             switch result {
             case .success(let url):
-                switch pendingImport {
-                case .logs:     importCSV(from: url)
-                case .schedule: importScheduleCSV(from: url)
-                }
+                pendingImportURL = url
+                showingImportModeDialog = true
             case .failure:
                 importResultMessage = "Could not open file."
                 showingImportResult = true
             }
         }
+        .confirmationDialog("Import Mode", isPresented: $showingImportModeDialog, titleVisibility: .visible) {
+            Button("Merge — Skip Duplicates") {
+                if let url = pendingImportURL { importVehicleCSV(from: url, mode: .merge) }
+            }
+            Button("Fresh Restore — Replace All Data", role: .destructive) {
+                if let url = pendingImportURL { importVehicleCSV(from: url, mode: .fresh) }
+            }
+            Button("Cancel", role: .cancel) { pendingImportURL = nil }
+        } message: {
+            Text("How would you like to import this file?")
+        }
         .alert("Import Complete", isPresented: $showingImportResult) {
             Button("OK", role: .cancel) { }
         } message: {
             Text(importResultMessage)
-        }
-        .alert("Skip to Next Due Mileage", isPresented: Binding(get: { reminderToSkip != nil }, set: { if !$0 { reminderToSkip = nil } })) {
-            TextField("Next due mileage", text: $skipMileageString)
-                #if os(iOS)
-                .keyboardType(.numberPad)
-                #endif
-            Button("Cancel", role: .cancel) { reminderToSkip = nil }
-            Button("Skip") {
-                if let target = Int(skipMileageString.filter { $0.isNumber }),
-                   let reminder = reminderToSkip {
-                    reminder.lastCompletedMileage = target - (reminder.mileageInterval ?? 0)
-                    reminderToSkip = nil
-                    refreshNotifications()
-                }
-            }
-        } message: {
-            if let reminder = reminderToSkip, let interval = reminder.mileageInterval {
-                Text("Set the next \(reminder.title) due mileage. Current odometer: \(vehicle.currentMileage) mi, interval: \(interval) mi.")
-            }
         }
     }
     
@@ -824,7 +802,9 @@ struct VehicleDetailView: View {
                 lastCompletedMileage: r.lastCompletedMileage,
                 currentMileage: vehicle.currentMileage,
                 timeFrequency: r.timeFrequency,
-                monthInterval: r.monthInterval
+                monthInterval: r.monthInterval,
+                nextReminderMileage: r.nextReminderMileage,
+                nextReminderDate: r.nextReminderDate
             )
         }
         NotificationManager.shared.refresh(vehicleName: vehicle.displayName, currentMileage: vehicle.currentMileage, reminders: data)
@@ -847,6 +827,7 @@ struct VehicleDetailView: View {
         editVin = vehicle.vin
         editImageData = vehicle.imageData
         editGasFillupDisabled = vehicle.gasFillupDisabled
+        editMileageUnit = vehicle.mileageUnit
         isEditingVehicle = true
     }
 
@@ -859,87 +840,186 @@ struct VehicleDetailView: View {
         vehicle.vin = editVin.uppercased()
         vehicle.imageData = editImageData
         vehicle.gasFillupDisabled = editGasFillupDisabled
+        vehicle.mileageUnit = editMileageUnit
         vehicle.lastModified = Date()
     }
 
-    private func importCSV(from url: URL) {
+    private func importVehicleCSV(from url: URL, mode: ImportMode) {
         guard url.startAccessingSecurityScopedResource() else {
             importResultMessage = "Permission denied for file."
             showingImportResult = true
             return
         }
         defer { url.stopAccessingSecurityScopedResource() }
-
         guard let content = try? String(contentsOf: url, encoding: .utf8) else {
             importResultMessage = "Could not read file."
             showingImportResult = true
             return
         }
-
         let rows = parseCSV(content)
         guard rows.count > 1 else {
             importResultMessage = "No records found in file."
             showingImportResult = true
             return
         }
-
         let headers = rows[0].map { $0.lowercased().trimmingCharacters(in: .whitespaces) }
-        guard let dateIdx = headers.firstIndex(of: "date"),
-              let typeIdx = headers.firstIndex(of: "type"),
-              let mileageIdx = headers.firstIndex(of: "mileage") else {
-            importResultMessage = "Unrecognized CSV format. Expected columns: Date, Type, Mileage."
-            showingImportResult = true
-            return
-        }
-
-        let gallonsIdx = headers.firstIndex(of: "gallons")
-        let partsIdx = headers.firstIndex(of: "parts cost")
-        let laborIdx = headers.firstIndex(of: "labor cost")
-        let totalIdx = headers.firstIndex(of: "total cost")
-        let notesIdx = headers.firstIndex(of: "notes")
-
-        let dateFormatter = DateFormatter()
-        dateFormatter.locale = Locale(identifier: "en_US_POSIX")
-        let dateFormats = ["M/d/yy", "M/d/yyyy", "MM/dd/yy", "MM/dd/yyyy", "yyyy-MM-dd"]
-
-        func parseDate(_ str: String) -> Date? {
-            for fmt in dateFormats {
-                dateFormatter.dateFormat = fmt
-                if let d = dateFormatter.date(from: str.trimmingCharacters(in: .whitespaces)) { return d }
-            }
-            return nil
-        }
 
         func col(_ row: [String], _ idx: Int?) -> String {
             guard let idx, row.indices.contains(idx) else { return "" }
             return row[idx].trimmingCharacters(in: .whitespaces)
         }
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        let fmts = ["M/d/yy", "M/d/yyyy", "MM/dd/yy", "MM/dd/yyyy", "yyyy-MM-dd"]
+        func parseDate(_ s: String) -> Date? {
+            for fmt in fmts { df.dateFormat = fmt; if let d = df.date(from: s.trimmingCharacters(in: .whitespaces)) { return d } }
+            return nil
+        }
+
+        if mode == .fresh {
+            vehicle.maintenanceLogs.forEach { modelContext.delete($0) }
+            vehicle.gasFillups.forEach { modelContext.delete($0) }
+            vehicle.reminders.forEach { modelContext.delete($0) }
+            vehicle.maintenanceLogs = []
+            vehicle.gasFillups = []
+            vehicle.reminders = []
+        }
 
         var imported = 0
-        for row in rows.dropFirst() {
-            guard row.indices.contains(max(dateIdx, typeIdx, mileageIdx)) else { continue }
-            guard let date = parseDate(col(row, dateIdx)) else { continue }
 
-            let mileage = Int(col(row, mileageIdx)) ?? 0
-            let type = col(row, typeIdx)
-            let notes = col(row, notesIdx)
-
-            if type.lowercased() == "gas fill-up" {
-                let gallons = Double(col(row, gallonsIdx)) ?? 0
-                let cost = Double(col(row, totalIdx)) ?? 0
-                let fillup = GasFillup(date: date, mileage: mileage, gallons: gallons, totalCost: cost, skippedPrevious: false)
-                fillup.vehicle = vehicle
-                vehicle.gasFillups.append(fillup)
-            } else {
-                let parts = Double(col(row, partsIdx)) ?? 0
-                let labor = Double(col(row, laborIdx)) ?? 0
-                let log = MaintenanceLog(date: date, mileage: mileage, serviceType: type.isEmpty ? "Other" : type, notes: notes, partsCost: parts, laborCost: labor)
-                log.vehicle = vehicle
-                vehicle.maintenanceLogs.append(log)
+        if headers.first == "recordtype" {
+            // Universal format
+            for row in rows.dropFirst() {
+                switch col(row, 0).lowercased() {
+                case "log":
+                    guard let date = parseDate(col(row, 9)) else { continue }
+                    let svc = col(row, 10); guard !svc.isEmpty else { continue }
+                    let mileage = Int(col(row, 11)) ?? 0
+                    if mode == .merge {
+                        let cal = Calendar.current
+                        let dup = vehicle.maintenanceLogs.contains {
+                            cal.isDate($0.date, inSameDayAs: date) && $0.serviceType == svc && $0.mileage == mileage
+                        }
+                        if dup { continue }
+                    }
+                    let log = MaintenanceLog(date: date, mileage: mileage, serviceType: svc,
+                        notes: col(row, 16),
+                        partsCost: Double(col(row, 13)) ?? 0, laborCost: Double(col(row, 14)) ?? 0)
+                    log.vehicle = vehicle; vehicle.maintenanceLogs.append(log)
+                    if mileage > vehicle.currentMileage { vehicle.currentMileage = mileage }
+                    imported += 1
+                case "fillup":
+                    guard let date = parseDate(col(row, 9)) else { continue }
+                    let gallons = Double(col(row, 12)) ?? 0; guard gallons > 0 else { continue }
+                    let mileage = Int(col(row, 11)) ?? 0
+                    if mode == .merge {
+                        let cal = Calendar.current
+                        let dup = vehicle.gasFillups.contains {
+                            cal.isDate($0.date, inSameDayAs: date) && $0.mileage == mileage
+                        }
+                        if dup { continue }
+                    }
+                    let fillup = GasFillup(date: date, mileage: mileage, gallons: gallons,
+                        totalCost: Double(col(row, 15)) ?? 0,
+                        skippedPrevious: col(row, 17).lowercased() == "true")
+                    fillup.vehicle = vehicle; vehicle.gasFillups.append(fillup)
+                    if mileage > vehicle.currentMileage { vehicle.currentMileage = mileage }
+                    imported += 1
+                case "reminder":
+                    let title = col(row, 10); guard !title.isEmpty else { continue }
+                    if mode == .merge {
+                        let dup = vehicle.reminders.contains { $0.title.lowercased() == title.lowercased() }
+                        if dup { continue }
+                    }
+                    let itype = ReminderIntervalType(rawValue: col(row, 18)) ?? .mileage
+                    let mi = Int(col(row, 20)).flatMap { $0 > 0 ? $0 : nil }
+                    let mo = Int(col(row, 21)).flatMap { $0 > 0 ? $0 : nil }
+                    let n = col(row, 16)
+                    let reminder = MaintenanceReminder(title: title, intervalType: itype,
+                        timeFrequency: TimeFrequency(rawValue: col(row, 19)),
+                        mileageInterval: mi, monthInterval: mo, notes: n.isEmpty ? "• " : n)
+                    reminder.lastCompletedMileage = Int(col(row, 22))
+                    reminder.lastCompletedDate    = parseDate(col(row, 23))
+                    reminder.nextReminderMileage  = Int(col(row, 24))
+                    reminder.nextReminderDate     = parseDate(col(row, 25))
+                    reminder.vehicle = vehicle; vehicle.reminders.append(reminder)
+                    imported += 1
+                default: continue
+                }
             }
-
-            if mileage > vehicle.currentMileage { vehicle.currentMileage = mileage }
-            imported += 1
+        } else if headers.contains("date") && (headers.contains("type") || headers.contains("service type")) {
+            // Old logs format
+            guard let dateIdx = headers.firstIndex(of: "date"),
+                  let typeIdx = headers.first(where: { $0 == "type" || $0 == "service type" }).flatMap({ headers.firstIndex(of: $0) }),
+                  let mileageIdx = headers.firstIndex(of: "mileage") else {
+                importResultMessage = "Unrecognized format."; showingImportResult = true; return
+            }
+            let gallonsIdx = headers.firstIndex(of: "gallons")
+            let partsIdx   = headers.firstIndex(of: "parts cost")
+            let laborIdx   = headers.firstIndex(of: "labor cost")
+            let totalIdx   = headers.firstIndex(of: "total cost")
+            let notesIdx   = headers.firstIndex(of: "notes")
+            let cal = Calendar.current
+            for row in rows.dropFirst() {
+                guard let date = parseDate(col(row, dateIdx)) else { continue }
+                let mileage = Int(col(row, mileageIdx)) ?? 0
+                let type = col(row, typeIdx)
+                if type.lowercased() == "gas fill-up" {
+                    if mode == .merge {
+                        let dup = vehicle.gasFillups.contains { cal.isDate($0.date, inSameDayAs: date) && $0.mileage == mileage }
+                        if dup { continue }
+                    }
+                    let fillup = GasFillup(date: date, mileage: mileage,
+                        gallons: Double(col(row, gallonsIdx)) ?? 0,
+                        totalCost: Double(col(row, totalIdx)) ?? 0, skippedPrevious: false)
+                    fillup.vehicle = vehicle; vehicle.gasFillups.append(fillup)
+                } else {
+                    if mode == .merge {
+                        let dup = vehicle.maintenanceLogs.contains { cal.isDate($0.date, inSameDayAs: date) && $0.serviceType == type && $0.mileage == mileage }
+                        if dup { continue }
+                    }
+                    let log = MaintenanceLog(date: date, mileage: mileage,
+                        serviceType: type.isEmpty ? "Other" : type,
+                        notes: col(row, notesIdx),
+                        partsCost: Double(col(row, partsIdx)) ?? 0,
+                        laborCost: Double(col(row, laborIdx)) ?? 0)
+                    log.vehicle = vehicle; vehicle.maintenanceLogs.append(log)
+                }
+                if mileage > vehicle.currentMileage { vehicle.currentMileage = mileage }
+                imported += 1
+            }
+        } else if headers.contains("title") && headers.contains("interval type") {
+            // Old schedule format
+            guard let titleIdx = headers.firstIndex(of: "title"),
+                  let itypeIdx = headers.firstIndex(of: "interval type") else {
+                importResultMessage = "Unrecognized format."; showingImportResult = true; return
+            }
+            let freqIdx   = headers.firstIndex(of: "frequency")
+            let miIdx     = headers.firstIndex(of: "mileage interval")
+            let moIdx     = headers.firstIndex(of: "month interval")
+            let notesIdx  = headers.firstIndex(of: "notes")
+            for row in rows.dropFirst() {
+                let title = col(row, titleIdx); guard !title.isEmpty else { continue }
+                if mode == .merge {
+                    let dup = vehicle.reminders.contains { $0.title.lowercased() == title.lowercased() }
+                    if dup { continue }
+                }
+                let itype = ReminderIntervalType(rawValue: col(row, itypeIdx)) ?? .mileage
+                let mi: Int? = { let v = Int(col(row, miIdx)) ?? 0; return v > 0 ? v : nil }()
+                let mo: Int? = { let v = Int(col(row, moIdx)) ?? 0; return v > 0 ? v : nil }()
+                let n = col(row, notesIdx)
+                let reminder = MaintenanceReminder(title: title, intervalType: itype,
+                    timeFrequency: itype == .time ? TimeFrequency(rawValue: col(row, freqIdx)) : nil,
+                    mileageInterval: itype == .mileage ? mi : nil,
+                    monthInterval: itype == .time ? mo : nil,
+                    notes: n.isEmpty ? "• " : n)
+                reminder.vehicle = vehicle; vehicle.reminders.append(reminder)
+                imported += 1
+            }
+        } else {
+            importResultMessage = "Unrecognized file format."
+            showingImportResult = true
+            return
         }
 
         vehicle.lastModified = Date()
@@ -947,149 +1027,12 @@ struct VehicleDetailView: View {
         showingImportResult = true
     }
 
-    private func importScheduleCSV(from url: URL) {
-        guard url.startAccessingSecurityScopedResource() else {
-            importResultMessage = "Permission denied for file."
-            showingImportResult = true
-            return
-        }
-        defer { url.stopAccessingSecurityScopedResource() }
-
-        guard let content = try? String(contentsOf: url, encoding: .utf8) else {
-            importResultMessage = "Could not read file."
-            showingImportResult = true
-            return
-        }
-
-        let rows = parseCSV(content)
-        guard rows.count > 1 else {
-            importResultMessage = "No records found in file."
-            showingImportResult = true
-            return
-        }
-
-        let headers = rows[0].map { $0.lowercased().trimmingCharacters(in: .whitespaces) }
-        guard let titleIdx = headers.firstIndex(of: "title"),
-              let intervalTypeIdx = headers.firstIndex(of: "interval type") else {
-            importResultMessage = "Unrecognized format. Expected columns: Title, Interval Type."
-            showingImportResult = true
-            return
-        }
-
-        let freqIdx = headers.firstIndex(of: "frequency")
-        let mileageIntervalIdx = headers.firstIndex(of: "mileage interval")
-        let monthIntervalIdx = headers.firstIndex(of: "month interval")
-        let notesIdx = headers.firstIndex(of: "notes")
-
-        func col(_ row: [String], _ idx: Int?) -> String {
-            guard let idx, row.indices.contains(idx) else { return "" }
-            return row[idx].trimmingCharacters(in: .whitespaces)
-        }
-
-        var imported = 0
-        for row in rows.dropFirst() {
-            guard row.indices.contains(max(titleIdx, intervalTypeIdx)) else { continue }
-            let title = col(row, titleIdx)
-            guard !title.isEmpty else { continue }
-
-            let intervalType = ReminderIntervalType(rawValue: col(row, intervalTypeIdx)) ?? .mileage
-
-            let mileageInterval: Int? = {
-                guard intervalType == .mileage else { return nil }
-                let v = Int(col(row, mileageIntervalIdx)) ?? 0
-                return v > 0 ? v : nil
-            }()
-
-            let timeFrequency: TimeFrequency? = intervalType == .time
-                ? TimeFrequency(rawValue: col(row, freqIdx))
-                : nil
-
-            let monthInterval: Int? = {
-                guard intervalType == .time else { return nil }
-                let v = Int(col(row, monthIntervalIdx)) ?? 0
-                return v > 0 ? v : nil
-            }()
-
-            let notes = col(row, notesIdx)
-            let reminder = MaintenanceReminder(
-                title: title,
-                intervalType: intervalType,
-                timeFrequency: timeFrequency,
-                mileageInterval: mileageInterval,
-                monthInterval: monthInterval,
-                notes: notes.isEmpty ? "• " : notes
-            )
-            reminder.vehicle = vehicle
-            vehicle.reminders.append(reminder)
-            imported += 1
-        }
-
-        vehicle.lastModified = Date()
-        importResultMessage = imported > 0 ? "Imported \(imported) reminder\(imported == 1 ? "" : "s")." : "No valid reminders found."
-        showingImportResult = true
-    }
-
-    private func parseCSV(_ text: String) -> [[String]] {
-        var rows: [[String]] = []
-        var currentRow: [String] = []
-        var currentField = ""
-        var inQuotes = false
-        var i = text.startIndex
-
-        while i < text.endIndex {
-            let char = text[i]
-            if inQuotes {
-                if char == "\"" {
-                    let next = text.index(after: i)
-                    if next < text.endIndex && text[next] == "\"" {
-                        currentField.append("\"")
-                        i = text.index(after: next)
-                        continue
-                    } else {
-                        inQuotes = false
-                    }
-                } else {
-                    currentField.append(char)
-                }
-            } else {
-                switch char {
-                case "\"":
-                    inQuotes = true
-                case ",":
-                    currentRow.append(currentField)
-                    currentField = ""
-                case "\r":
-                    let next = text.index(after: i)
-                    if next < text.endIndex && text[next] == "\n" { i = next }
-                    currentRow.append(currentField)
-                    currentField = ""
-                    if !currentRow.allSatisfy({ $0.isEmpty }) { rows.append(currentRow) }
-                    currentRow = []
-                case "\n":
-                    currentRow.append(currentField)
-                    currentField = ""
-                    if !currentRow.allSatisfy({ $0.isEmpty }) { rows.append(currentRow) }
-                    currentRow = []
-                default:
-                    currentField.append(char)
-                }
-            }
-            i = text.index(after: i)
-        }
-
-        if !currentField.isEmpty || !currentRow.isEmpty {
-            currentRow.append(currentField)
-            if !currentRow.allSatisfy({ $0.isEmpty }) { rows.append(currentRow) }
-        }
-
-        return rows
-    }
-
 }
 
 struct ReminderRow: View {
     let reminder: MaintenanceReminder
     let currentMileage: Int
+    var unitLabel: String = "mi"
     var onComplete: () -> Void
     var onEdit: () -> Void
     var onDelete: () -> Void
@@ -1103,17 +1046,20 @@ struct ReminderRow: View {
                     .font(.headline)
                 
                 if reminder.intervalType == .mileage, let interval = reminder.mileageInterval {
-                    let lastCompleted = reminder.lastCompletedMileage ?? 0
-                    let nextDue = lastCompleted + interval
+                    let isPinned = reminder.nextReminderMileage != nil
+                    let nextDue = reminder.nextReminderMileage ?? ((reminder.lastCompletedMileage ?? 0) + interval)
                     let remaining = nextDue - currentMileage
-                    
+
                     HStack {
-                        Text("Every \(interval) miles")
+                        Text("Every \(interval) \(unitLabel)")
                         Text("•")
+                        if isPinned { Image(systemName: "pin.fill").font(.caption2) }
                         if remaining <= 0 {
                             Text("OVERDUE").foregroundStyle(.red).bold()
+                        } else if isPinned {
+                            Text("Due at \(nextDue) \(unitLabel)").foregroundStyle(.secondary)
                         } else {
-                            Text("\(remaining) miles left").foregroundStyle(.secondary)
+                            Text("\(remaining) \(unitLabel) left").foregroundStyle(.secondary)
                         }
                     }
                     .font(.caption)
@@ -1129,9 +1075,20 @@ struct ReminderRow: View {
                             return "Every Month"
                         }
                     }()
-                    Text(detail)
+                    if let nextDate = reminder.nextReminderDate {
+                        HStack {
+                            Text(detail)
+                            Text("•")
+                            Image(systemName: "pin.fill").font(.caption2)
+                            Text(nextDate, format: .dateTime.month(.abbreviated).day().year())
+                        }
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    } else {
+                        Text(detail)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
             }
             Spacer()
@@ -1179,7 +1136,7 @@ struct AddReminderView: View {
     init(vehicle: Vehicle, editingReminder: MaintenanceReminder? = nil) {
         self.vehicle = vehicle
         self.editingReminder = editingReminder
-        
+
         if let editing = editingReminder {
             _title = State(initialValue: editing.title)
             _intervalType = State(initialValue: editing.intervalType)
@@ -1187,6 +1144,8 @@ struct AddReminderView: View {
             _mileageInterval = State(initialValue: editing.mileageInterval ?? 5000)
             _selectedMonth = State(initialValue: editing.monthInterval ?? 1)
             _notes = State(initialValue: editing.notes)
+        } else if vehicle.mileageUnit == .none {
+            _intervalType = State(initialValue: .time)
         }
     }
     
@@ -1207,18 +1166,21 @@ struct AddReminderView: View {
                     }
                 }
                 
-                Section("Interval Type") {
-                    Picker("Type", selection: $intervalType) {
-                        Text("Mileage").tag(ReminderIntervalType.mileage)
-                        Text("Time").tag(ReminderIntervalType.time)
+                if vehicle.mileageUnit.tracksMileage {
+                    Section("Interval Type") {
+                        Picker("Type", selection: $intervalType) {
+                            Text(vehicle.mileageUnit == .hours ? "Hours" : "Mileage").tag(ReminderIntervalType.mileage)
+                            Text("Time").tag(ReminderIntervalType.time)
+                        }
+                        .pickerStyle(.segmented)
                     }
-                    .pickerStyle(.segmented)
                 }
-                
-                if intervalType == .mileage {
-                    Section("Mileage Interval") {
+
+                if intervalType == .mileage && vehicle.mileageUnit.tracksMileage {
+                    let unitLabel = vehicle.mileageUnit.label
+                    Section(vehicle.mileageUnit == .hours ? "Hour Interval" : "Mileage Interval") {
                         HStack {
-                            Text("\(mileageInterval) miles")
+                            Text("\(mileageInterval) \(unitLabel)")
                             Spacer()
                             Stepper("", value: $mileageInterval, in: 2500...100000, step: 2500)
                         }
@@ -1368,6 +1330,7 @@ struct AddMaintenanceLogView: View {
     @State private var isDIY = true
 
     @FocusState private var isManualMileageFocused: Bool
+    @State private var mileageString: String
     @State private var receiptItem: PhotosPickerItem?
     @State private var receiptImageData: Data?
 
@@ -1390,7 +1353,9 @@ struct AddMaintenanceLogView: View {
             "Inspection", "Detailing", "Other"
         ]
 
+        let initialMileage: Int
         if let log = editingLog {
+            initialMileage = log.mileage
             _date = State(initialValue: log.date)
             _mileage = State(initialValue: log.mileage)
             _notes = State(initialValue: log.notes)
@@ -1405,7 +1370,8 @@ struct AddMaintenanceLogView: View {
                 _customServiceType = State(initialValue: log.serviceType)
             }
         } else {
-            _mileage = State(initialValue: (vehicle.currentMileage / 100) * 100)
+            initialMileage = (vehicle.currentMileage / 100) * 100
+            _mileage = State(initialValue: initialMileage)
             if let prepop = initialServiceType {
                 if categories.contains(prepop) {
                     _serviceType = State(initialValue: prepop)
@@ -1417,6 +1383,7 @@ struct AddMaintenanceLogView: View {
                 _serviceType = State(initialValue: "Oil Change")
             }
         }
+        _mileageString = State(initialValue: formatMileage("\(initialMileage)"))
     }
 
     var body: some View {
@@ -1435,18 +1402,22 @@ struct AddMaintenanceLogView: View {
                         TextField("Specify Service", text: $customServiceType)
                     }
                     
-                    VStack(alignment: .leading) {
+                    if vehicle.mileageUnit.tracksMileage { VStack(alignment: .leading) {
                         HStack {
-                            Text("Mileage")
+                            Text(vehicle.mileageUnit == .hours ? "Hours" : "Mileage")
                             Spacer()
-                            TextField("Manual Entry", value: $mileage, format: .number)
+                            TextField("Manual Entry", text: $mileageString)
                                 #if os(iOS)
                                 .keyboardType(.numberPad)
                                 #endif
                                 .multilineTextAlignment(.trailing)
                                 .focused($isManualMileageFocused)
+                                .onChange(of: mileageString) { _, val in
+                                    mileageString = formatMileage(val)
+                                    if let n = Int(val.filter { $0.isNumber }) { mileage = n }
+                                }
                         }
-                        
+
                         Picker("Mileage Picker", selection: $mileage) {
                             let start = max(0, (mileage / 25) * 25 - 500)
                             let end = (mileage / 25) * 25 + 5000
@@ -1460,7 +1431,11 @@ struct AddMaintenanceLogView: View {
                         #else
                         .pickerStyle(.menu)
                         #endif
-                    }
+                        .onChange(of: mileage) { _, val in
+                            let f = formatMileage("\(val)")
+                            if mileageString != f { mileageString = f }
+                        }
+                    } }  // closes VStack + if vehicle.mileageUnit.tracksMileage
                 }
 
                 Section("Costs") {
@@ -1577,12 +1552,18 @@ struct AddMaintenanceLogView: View {
 struct OdometerView: View {
     @Binding var mileage: Int
     let accentColor: Color
+    var unitLabel: String = "mi"
     @State private var isEditing = false
     @State private var tempMileageString: String = ""
-    
+
+    private var headerLabel: String { unitLabel == "hr" ? "HOUR METER" : "ODOMETER" }
+    private var alertTitle: String { unitLabel == "hr" ? "Update Hour Meter" : "Update Odometer" }
+    private var alertPrompt: String { unitLabel == "hr" ? "Enter current hours." : "Enter the current mileage for your vehicle." }
+    private var alertPlaceholder: String { unitLabel == "hr" ? "Current Hours" : "Current Mileage" }
+
     var body: some View {
         VStack(alignment: .center, spacing: 4) {
-            Text("ODOMETER")
+            Text(headerLabel)
                 .font(.caption2.bold())
                 .tracking(2)
                 .foregroundStyle(.secondary)
@@ -1620,19 +1601,19 @@ struct OdometerView: View {
         }
         .frame(maxWidth: .infinity)
         .padding(.vertical, 8)
-        .alert("Update Odometer", isPresented: $isEditing) {
-            TextField("Current Mileage", text: $tempMileageString)
+        .alert(alertTitle, isPresented: $isEditing) {
+            TextField(alertPlaceholder, text: $tempMileageString)
                 #if os(iOS)
                 .keyboardType(.numberPad)
                 #endif
             Button("Cancel", role: .cancel) { }
             Button("Save") {
-                if let val = Int(tempMileageString) {
+                if let val = Int(tempMileageString.filter { $0.isNumber }), val > 0 {
                     mileage = val
                 }
             }
         } message: {
-            Text("Enter the current mileage for your vehicle.")
+            Text(alertPrompt)
         }
     }
 }
@@ -1695,7 +1676,7 @@ struct AddGasFillupView: View {
         if let fillup = editingFillup {
             _selectedVehicle = State(initialValue: fillup.vehicle ?? vehicles.first)
             _date = State(initialValue: fillup.date)
-            _mileageString = State(initialValue: Self.formatMileage(String(fillup.mileage)))
+            _mileageString = State(initialValue: formatMileage(String(fillup.mileage)))
             _gallonsString = State(initialValue: String(fillup.gallons))
             _totalCost = State(initialValue: fillup.totalCost)
             _skippedPrevious = State(initialValue: fillup.skippedPrevious)
@@ -1704,13 +1685,6 @@ struct AddGasFillupView: View {
         }
     }
 
-    private static func formatMileage(_ raw: String) -> String {
-        let digits = raw.filter { $0.isNumber }
-        guard !digits.isEmpty, let n = Int(digits) else { return digits }
-        let fmt = NumberFormatter()
-        fmt.numberStyle = .decimal
-        return fmt.string(from: NSNumber(value: n)) ?? digits
-    }
 
     private var isValid: Bool {
         selectedVehicle != nil &&
@@ -1743,7 +1717,7 @@ struct AddGasFillupView: View {
                             .multilineTextAlignment(.trailing)
                             .focused($focus, equals: .mileage)
                             .onChange(of: mileageString) { _, val in
-                                mileageString = Self.formatMileage(val)
+                                mileageString = formatMileage(val)
                             }
                     }
 
@@ -1831,8 +1805,7 @@ struct AllRemindersView: View {
     @AppStorage("scheduleSortOrder") private var scheduleSortOrder: String = "nextUp"
 
     @State private var reminderToEdit: MaintenanceReminder?
-    @State private var reminderToSkip: MaintenanceReminder?
-    @State private var skipMileageString = ""
+    @State private var reminderToSetNext: MaintenanceReminder?
     @State private var showingAddReminder = false
     @State private var showingClearSchedule = false
     @State private var showingScheduleSettings = false
@@ -1865,10 +1838,13 @@ struct AllRemindersView: View {
                 ReminderRow(
                     reminder: reminder,
                     currentMileage: vehicle.currentMileage,
+                    unitLabel: vehicle.mileageUnit.label,
                     onComplete: {
                         logToPrepopulate = reminder.title
                         reminder.lastCompletedDate = Date()
                         reminder.lastCompletedMileage = vehicle.currentMileage
+                        reminder.nextReminderMileage = nil
+                        reminder.nextReminderDate = nil
                         showingAddLog = true
                     },
                     onEdit: { reminderToEdit = reminder },
@@ -1886,13 +1862,10 @@ struct AllRemindersView: View {
                         .tint(.orange)
                 }
                 .swipeActions(edge: .leading) {
-                    if reminder.intervalType == .mileage, let interval = reminder.mileageInterval {
-                        Button {
-                            skipMileageString = "\(vehicle.currentMileage + interval)"
-                            reminderToSkip = reminder
-                        } label: { Label("Skip", systemImage: "forward.circle") }
-                        .tint(.blue)
-                    }
+                    Button {
+                        reminderToSetNext = reminder
+                    } label: { Label("Set Next", systemImage: "pin") }
+                    .tint(.blue)
                 }
             }
         }
@@ -1923,6 +1896,9 @@ struct AllRemindersView: View {
         .sheet(item: $reminderToEdit, onDismiss: refreshNotifications) { reminder in
             AddReminderView(vehicle: vehicle, editingReminder: reminder)
         }
+        .sheet(item: $reminderToSetNext, onDismiss: refreshNotifications) { reminder in
+            SetNextReminderSheet(reminder: reminder, currentMileage: vehicle.currentMileage, unitLabel: vehicle.mileageUnit.label)
+        }
         .sheet(isPresented: $showingScheduleSettings) {
             ScheduleViewSettingsSheet()
         }
@@ -1935,25 +1911,6 @@ struct AllRemindersView: View {
         }
         .sheet(isPresented: $showingAddLog) {
             AddMaintenanceLogView(vehicle: vehicle, initialServiceType: logToPrepopulate)
-        }
-        .alert("Skip to Next Due Mileage", isPresented: Binding(get: { reminderToSkip != nil }, set: { if !$0 { reminderToSkip = nil } })) {
-            TextField("Next due mileage", text: $skipMileageString)
-                #if os(iOS)
-                .keyboardType(.numberPad)
-                #endif
-            Button("Cancel", role: .cancel) { reminderToSkip = nil }
-            Button("Skip") {
-                if let target = Int(skipMileageString.filter { $0.isNumber }),
-                   let reminder = reminderToSkip {
-                    reminder.lastCompletedMileage = target - (reminder.mileageInterval ?? 0)
-                    reminderToSkip = nil
-                    refreshNotifications()
-                }
-            }
-        } message: {
-            if let reminder = reminderToSkip, let interval = reminder.mileageInterval {
-                Text("Set the next \(reminder.title) due mileage. Current odometer: \(vehicle.currentMileage) mi, interval: \(interval) mi.")
-            }
         }
         .tint(Color.fromName(accentColorName))
         .preferredColorScheme(isDarkMode ? .dark : .light)
@@ -1969,7 +1926,9 @@ struct AllRemindersView: View {
                 lastCompletedMileage: r.lastCompletedMileage,
                 currentMileage: vehicle.currentMileage,
                 timeFrequency: r.timeFrequency,
-                monthInterval: r.monthInterval
+                monthInterval: r.monthInterval,
+                nextReminderMileage: r.nextReminderMileage,
+                nextReminderDate: r.nextReminderDate
             )
         }
         NotificationManager.shared.refresh(vehicleName: vehicle.displayName, currentMileage: vehicle.currentMileage, reminders: data)
@@ -2033,7 +1992,14 @@ struct ClearScheduleSheet: View {
 
 // MARK: - Schedule sort helpers (shared by VehicleDetailView + AllRemindersView)
 
-private func reminderMilesUntilDue(_ r: MaintenanceReminder, currentMileage: Int) -> Int {
+func reminderMilesUntilDue(_ r: MaintenanceReminder, currentMileage: Int) -> Int {
+    if let nextMileage = r.nextReminderMileage {
+        return nextMileage - currentMileage
+    }
+    if let nextDate = r.nextReminderDate {
+        let days = Calendar.current.dateComponents([.day], from: Date(), to: nextDate).day ?? 0
+        return days * 30
+    }
     switch r.intervalType {
     case .mileage:
         let last = r.lastCompletedMileage ?? 0
@@ -2107,6 +2073,483 @@ struct ScheduleViewSettingsSheet: View {
         #endif
     }
 }
+
+struct SetNextReminderSheet: View {
+    let reminder: MaintenanceReminder
+    let currentMileage: Int
+    var unitLabel: String = "mi"
+    @Environment(\.dismiss) private var dismiss
+
+    enum OverrideType { case odometer, date }
+    @State private var overrideType: OverrideType
+    @State private var odometerString: String
+    @State private var targetDate: Date
+
+    init(reminder: MaintenanceReminder, currentMileage: Int, unitLabel: String = "mi") {
+        self.reminder = reminder
+        self.currentMileage = currentMileage
+        self.unitLabel = unitLabel
+
+        let defaultType: OverrideType = reminder.nextReminderDate != nil || reminder.intervalType == .time ? .date : .odometer
+        _overrideType = State(initialValue: defaultType)
+
+        let smartMileage = reminder.nextReminderMileage
+            ?? max(currentMileage + 1, (reminder.lastCompletedMileage ?? currentMileage) + (reminder.mileageInterval ?? 5000))
+        _odometerString = State(initialValue: formatMileage("\(smartMileage)"))
+
+        _targetDate = State(initialValue: reminder.nextReminderDate ?? Date())
+    }
+
+    private var isSaveDisabled: Bool {
+        overrideType == .odometer && (Int(odometerString.filter { $0.isNumber }) ?? 0) <= 0
+    }
+
+    var body: some View {
+        NavigationStack {
+            Form {
+                Section {
+                    Picker("", selection: $overrideType) {
+                        Text(unitLabel == "hr" ? "Hour Meter" : "Odometer").tag(OverrideType.odometer)
+                        Text("Date").tag(OverrideType.date)
+                    }
+                    .pickerStyle(.segmented)
+                }
+
+                if overrideType == .odometer {
+                    Section(unitLabel == "hr" ? "Next Due Hours" : "Next Due Mileage") {
+                        TextField(unitLabel == "hr" ? "Hour meter reading" : "Odometer reading", text: $odometerString)
+                            #if os(iOS)
+                            .keyboardType(.numberPad)
+                            #endif
+                            .multilineTextAlignment(.trailing)
+                            .onChange(of: odometerString) { _, val in
+                                odometerString = formatMileage(val)
+                            }
+                    }
+                } else {
+                    Section("Next Due Date") {
+                        DatePicker("", selection: $targetDate, displayedComponents: .date)
+                            .datePickerStyle(.graphical)
+                            .labelsHidden()
+                    }
+                }
+
+                if reminder.nextReminderMileage != nil || reminder.nextReminderDate != nil {
+                    Section {
+                        Button(role: .destructive) {
+                            reminder.nextReminderMileage = nil
+                            reminder.nextReminderDate = nil
+                            dismiss()
+                        } label: {
+                            Label("Clear Override", systemImage: "pin.slash")
+                                .frame(maxWidth: .infinity, alignment: .center)
+                        }
+                    }
+                }
+            }
+            .navigationTitle("Set Next Reminder")
+            #if os(iOS)
+            .navigationBarTitleDisplayMode(.inline)
+            #endif
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") { dismiss() }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Save") {
+                        if overrideType == .odometer {
+                            let parsed = Int(odometerString.filter { $0.isNumber })
+                            reminder.nextReminderMileage = (parsed ?? 0) > 0 ? parsed : nil
+                            reminder.nextReminderDate = nil
+                        } else {
+                            reminder.nextReminderDate = targetDate
+                            reminder.nextReminderMileage = nil
+                        }
+                        dismiss()
+                    }
+                    .disabled(isSaveDisabled)
+                }
+            }
+        }
+        #if os(macOS)
+        .frame(minWidth: 380, minHeight: 300)
+        #endif
+    }
+}
+
+enum ImportMode { case merge, fresh }
+
+// MARK: - Shared helpers (accessible from SettingsView and VehicleDetailView)
+
+func formatMileage(_ raw: String) -> String {
+    let digits = raw.filter { $0.isNumber }
+    guard !digits.isEmpty, let n = Int(digits) else { return digits }
+    let fmt = NumberFormatter()
+    fmt.numberStyle = .decimal
+    return fmt.string(from: NSNumber(value: n)) ?? digits
+}
+
+func garageCSVHeader() -> String {
+    "RecordType,Nickname,Year,Make,Model,VIN,LicensePlate,TrackFuel,CurrentMileage,Date,ServiceType,Mileage,Gallons,PartsCost,LaborCost,TotalCost,Notes,SkippedPrevious,IntervalType,Frequency,MileageInterval,MonthInterval,LastCompletedMileage,LastCompletedDate,NextReminderMileage,NextReminderDate\n"
+}
+
+func vehicleCSVRows(_ vehicle: Vehicle, using df: DateFormatter) -> String {
+    func esc(_ s: String) -> String { "\"\(s.replacingOccurrences(of: "\"", with: "\"\""))\"" }
+    let v = [esc(vehicle.name), "\(vehicle.year)", esc(vehicle.make), esc(vehicle.model),
+             esc(vehicle.vin), esc(vehicle.licensePlate),
+             vehicle.gasFillupDisabled ? "false" : "true",
+             "\(vehicle.currentMileage)"].joined(separator: ",")
+
+    var dated: [(Date, String)] = []
+    for log in vehicle.maintenanceLogs {
+        let row = ["log", v, df.string(from: log.date), esc(log.serviceType),
+                   "\(log.mileage)", "", "\(log.partsCost)", "\(log.laborCost)",
+                   "\(log.totalCost)", esc(log.notes)].joined(separator: ",") + "\n"
+        dated.append((log.date, row))
+    }
+    for fillup in vehicle.gasFillups {
+        let row = ["fillup", v, df.string(from: fillup.date),
+                   "", "\(fillup.mileage)", String(format: "%.3f", fillup.gallons),
+                   "", "", String(format: "%.2f", fillup.totalCost), "",
+                   fillup.skippedPrevious ? "true" : "false"].joined(separator: ",") + "\n"
+        dated.append((fillup.date, row))
+    }
+    dated.sort { $0.0 > $1.0 }
+    var result = dated.map { $0.1 }.joined()
+
+    for r in vehicle.reminders {
+        let row = ["reminder", v, "", esc(r.title), "", "", "", "", esc(r.notes), "",
+                   r.intervalType.rawValue,
+                   r.timeFrequency?.rawValue ?? "",
+                   "\(r.mileageInterval ?? 0)",
+                   "\(r.monthInterval ?? 0)",
+                   r.lastCompletedMileage.map { "\($0)" } ?? "",
+                   r.lastCompletedDate.map { df.string(from: $0) } ?? "",
+                   r.nextReminderMileage.map { "\($0)" } ?? "",
+                   r.nextReminderDate.map { df.string(from: $0) } ?? ""].joined(separator: ",") + "\n"
+        result += row
+    }
+    return result
+}
+
+func parseCSV(_ text: String) -> [[String]] {
+    var rows: [[String]] = []
+    var currentRow: [String] = []
+    var currentField = ""
+    var inQuotes = false
+    var i = text.startIndex
+    while i < text.endIndex {
+        let char = text[i]
+        if inQuotes {
+            if char == "\"" {
+                let next = text.index(after: i)
+                if next < text.endIndex && text[next] == "\"" {
+                    currentField.append("\""); i = text.index(after: next); continue
+                } else { inQuotes = false }
+            } else { currentField.append(char) }
+        } else {
+            switch char {
+            case "\"": inQuotes = true
+            case ",": currentRow.append(currentField); currentField = ""
+            case "\r":
+                let next = text.index(after: i)
+                if next < text.endIndex && text[next] == "\n" { i = next }
+                currentRow.append(currentField); currentField = ""
+                if !currentRow.allSatisfy({ $0.isEmpty }) { rows.append(currentRow) }
+                currentRow = []
+            case "\n":
+                currentRow.append(currentField); currentField = ""
+                if !currentRow.allSatisfy({ $0.isEmpty }) { rows.append(currentRow) }
+                currentRow = []
+            default: currentField.append(char)
+            }
+        }
+        i = text.index(after: i)
+    }
+    if !currentField.isEmpty || !currentRow.isEmpty {
+        currentRow.append(currentField)
+        if !currentRow.allSatisfy({ $0.isEmpty }) { rows.append(currentRow) }
+    }
+    return rows
+}
+
+#if os(iOS)
+import UIKit
+
+struct PDFReport: Transferable {
+    let name: String
+    let data: Data
+    static var transferRepresentation: some TransferRepresentation {
+        FileRepresentation(exportedContentType: .pdf) { r in
+            let url = FileManager.default.temporaryDirectory
+                .appendingPathComponent(r.name).appendingPathExtension("pdf")
+            try r.data.write(to: url)
+            return SentTransferredFile(url)
+        }
+    }
+}
+
+func generateVehiclePDF(vehicle: Vehicle) -> PDFReport? {
+    let pageW: CGFloat = 612, pageH: CGFloat = 792, margin: CGFloat = 44
+    let contentW = pageW - margin * 2
+    let df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .none
+
+    let fSec    = UIFont.systemFont(ofSize: 13, weight: .semibold)
+    let fBody   = UIFont.systemFont(ofSize: 10, weight: .regular)
+    let fSmall  = UIFont.systemFont(ofSize: 8,  weight: .regular)
+    let fColHdr = UIFont.systemFont(ofSize: 9,  weight: .semibold)
+    let nf      = NumberFormatter(); nf.numberStyle = .decimal
+
+    // Explicit light-mode colors — adaptive UIColor (label, systemGray6, etc.) can render
+    // as dark/invisible in dark-mode trait context during PDF generation.
+    func resolveAccentUIColor() -> UIColor {
+        let name = UserDefaults.standard.string(forKey: "accentColorName") ?? "blue"
+        if name == "custom" {
+            let h = (UserDefaults.standard.string(forKey: "customAccentColorHex") ?? "")
+                .trimmingCharacters(in: .whitespacesAndNewlines).replacingOccurrences(of: "#", with: "")
+            if h.count == 6, let rgb = UInt64(h, radix: 16) {
+                return UIColor(red: CGFloat((rgb >> 16) & 0xFF) / 255,
+                               green: CGFloat((rgb >> 8)  & 0xFF) / 255,
+                               blue:  CGFloat( rgb        & 0xFF) / 255, alpha: 1)
+            }
+        }
+        switch name {
+        case "red":    return .systemRed
+        case "orange": return .systemOrange
+        case "yellow": return .systemYellow
+        case "green":  return .systemGreen
+        case "teal":   return .systemTeal
+        case "indigo": return .systemIndigo
+        case "purple": return .systemPurple
+        case "pink":   return .systemPink
+        default:       return .systemBlue
+        }
+    }
+    let rawAccent = resolveAccentUIColor()
+    // Yellow and other pale colors don't contrast on white — fall back to near-black
+    var _r: CGFloat = 0, _g: CGFloat = 0, _b: CGFloat = 0, _a: CGFloat = 0
+    rawAccent.getRed(&_r, green: &_g, blue: &_b, alpha: &_a)
+    let accent = (0.2126 * _r + 0.7152 * _g + 0.0722 * _b) > 0.72
+        ? UIColor(white: 0.15, alpha: 1)
+        : rawAccent
+    let shade     = UIColor(white: 0.95, alpha: 1)
+    let secondary = UIColor(white: 0.45, alpha: 1)
+    let textBlack = UIColor(white: 0.10, alpha: 1)
+    let headerBg  = UIColor(white: 0.82, alpha: 1)
+
+    var y: CGFloat = 0
+    var pageNum = 0
+
+    let pdfData = UIGraphicsPDFRenderer(
+        bounds: CGRect(x: 0, y: 0, width: pageW, height: pageH)
+    ).pdfData { ctx in
+
+        func newPage() {
+            ctx.beginPage()
+            UIColor.white.setFill()
+            UIBezierPath(rect: CGRect(x: 0, y: 0, width: pageW, height: pageH)).fill()
+            pageNum += 1
+            if pageNum > 1 {
+                accent.setFill()
+                UIBezierPath(rect: CGRect(x: 0, y: 0, width: pageW, height: 26)).fill()
+                let a: [NSAttributedString.Key: Any] = [.font: UIFont.systemFont(ofSize: 10, weight: .semibold), .foregroundColor: UIColor.white]
+                ("\(vehicle.displayName) — Service Record" as NSString)
+                    .draw(in: CGRect(x: margin, y: 5, width: contentW, height: 16), withAttributes: a)
+            }
+            y = pageNum == 1 ? 0 : 38
+        }
+
+        func footerPageNum() {
+            let s = "Page \(pageNum)" as NSString
+            let a: [NSAttributedString.Key: Any] = [.font: fSmall, .foregroundColor: secondary]
+            let sz = s.size(withAttributes: a)
+            s.draw(at: CGPoint(x: pageW - margin - sz.width, y: pageH - margin + 6), withAttributes: a)
+        }
+
+        func needsBreak(_ h: CGFloat) -> Bool { y + h > pageH - margin - 20 }
+
+        func breakPage() { footerPageNum(); newPage() }
+
+        func sectionHeader(_ title: String) {
+            if needsBreak(44) { breakPage() }
+            let barRect = CGRect(x: margin, y: y, width: contentW, height: 22)
+            accent.withAlphaComponent(0.10).setFill()
+            UIBezierPath(roundedRect: barRect, cornerRadius: 3).fill()
+            accent.setFill()
+            UIBezierPath(rect: CGRect(x: margin, y: y, width: 4, height: 22)).fill()
+            let a: [NSAttributedString.Key: Any] = [.font: fSec, .foregroundColor: accent]
+            (title as NSString).draw(in: CGRect(x: margin + 12, y: y + 4, width: contentW - 16, height: 16), withAttributes: a)
+            y += 28
+        }
+
+        func labelValue(_ label: String, _ value: String) {
+            if needsBreak(17) { breakPage() }
+            let la: [NSAttributedString.Key: Any] = [.font: fSmall, .foregroundColor: secondary]
+            let va: [NSAttributedString.Key: Any] = [.font: fBody,  .foregroundColor: textBlack]
+            (label.uppercased() as NSString).draw(in: CGRect(x: margin, y: y, width: 110, height: 14), withAttributes: la)
+            (value as NSString).draw(in: CGRect(x: margin + 118, y: y, width: contentW - 118, height: 14), withAttributes: va)
+            y += 17
+        }
+
+        typealias Col = (String, CGFloat, NSTextAlignment)
+
+        func tableHeader(_ cols: [Col]) {
+            if needsBreak(20) { breakPage() }
+            headerBg.setFill()
+            UIBezierPath(rect: CGRect(x: margin, y: y, width: contentW, height: 20)).fill()
+            var x = margin + 6
+            for (t, w, _) in cols {
+                let a: [NSAttributedString.Key: Any] = [.font: fColHdr, .foregroundColor: textBlack]
+                (t as NSString).draw(in: CGRect(x: x, y: y + 4, width: w - 8, height: 14), withAttributes: a)
+                x += w
+            }
+            y += 20
+        }
+
+        func tableRow(_ cols: [Col], idx: Int, rowH: CGFloat, redFlag: Bool = false) {
+            if needsBreak(rowH) { footerPageNum(); newPage() }
+            if idx % 2 == 1 {
+                shade.setFill()
+                UIBezierPath(rect: CGRect(x: margin, y: y, width: contentW, height: rowH)).fill()
+            }
+            var x = margin + 6
+            for (colIdx, (text, w, align)) in cols.enumerated() {
+                let isLastCol = colIdx == cols.count - 1
+                let fg: UIColor = redFlag && isLastCol ? .systemRed : textBlack
+                let f: UIFont  = redFlag && isLastCol ? UIFont.systemFont(ofSize: 10, weight: .bold) : fBody
+                let para = NSMutableParagraphStyle()
+                para.alignment = align
+                para.lineBreakMode = isLastCol ? .byWordWrapping : .byTruncatingTail
+                let a: [NSAttributedString.Key: Any] = [.font: f, .foregroundColor: fg, .paragraphStyle: para]
+                (text as NSString).draw(in: CGRect(x: x, y: y + 3, width: w - 8, height: rowH - 4), withAttributes: a)
+                x += w
+            }
+            y += rowH
+        }
+
+        // ── PAGE 1 ───────────────────────────────────────────────────────
+        newPage()
+
+        let headerH: CGFloat = 84
+        accent.setFill()
+        UIBezierPath(rect: CGRect(x: 0, y: 0, width: pageW, height: headerH)).fill()
+
+        let titleA: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 24, weight: .bold),
+            .foregroundColor: UIColor.white, .kern: 0.4
+        ]
+        // Wide letter-spacing gives a small-caps feel for the make/model line
+        let subLine = vehicle.name.isEmpty
+            ? "\(vehicle.year)"
+            : "\(vehicle.year)  \(vehicle.make.uppercased())  \(vehicle.model.uppercased())"
+        let subA: [NSAttributedString.Key: Any] = [
+            .font: UIFont.systemFont(ofSize: 10, weight: .regular),
+            .foregroundColor: UIColor.white.withAlphaComponent(0.80),
+            .kern: 1.6
+        ]
+        let smallA: [NSAttributedString.Key: Any] = [
+            .font: fSmall, .foregroundColor: UIColor.white.withAlphaComponent(0.70)
+        ]
+
+        (vehicle.displayName as NSString).draw(in: CGRect(x: margin, y: 14, width: contentW * 0.75, height: 30), withAttributes: titleA)
+        (subLine as NSString).draw(in: CGRect(x: margin, y: 48, width: contentW * 0.75, height: 16), withAttributes: subA)
+
+        let gen = "Generated \(DateFormatter.localizedString(from: Date(), dateStyle: .long, timeStyle: .none))"
+        let genSz = (gen as NSString).size(withAttributes: smallA)
+        (gen as NSString).draw(at: CGPoint(x: pageW - margin - genSz.width, y: headerH - 14), withAttributes: smallA)
+
+        y = headerH + 18
+
+        // ── VEHICLE DETAILS ──────────────────────────────────────────────
+        sectionHeader("Vehicle Details")
+        let odomStr = nf.string(from: NSNumber(value: vehicle.currentMileage)) ?? "\(vehicle.currentMileage)"
+        let unitLabel = vehicle.mileageUnit == .none ? "N/A" : "\(odomStr) \(vehicle.mileageUnit.label)"
+        let detailRows: [(String, String)] = [
+            ("Year",    "\(vehicle.year)"),
+            ("Make",    vehicle.make.isEmpty ? "—" : vehicle.make),
+            ("Model",   vehicle.model.isEmpty ? "—" : vehicle.model),
+            ("Nickname", vehicle.name.isEmpty ? "—" : vehicle.name),
+            ("License Plate", vehicle.licensePlate.isEmpty ? "—" : vehicle.licensePlate),
+            ("VIN",     vehicle.vin.isEmpty ? "—" : vehicle.vin),
+            (vehicle.mileageUnit == .hours ? "Current Hours" : "Current Mileage", unitLabel),
+            ("Fuel Tracking", vehicle.gasFillupDisabled ? "Disabled" : "Enabled"),
+        ]
+        for (l, v2) in detailRows { labelValue(l, v2) }
+        y += 10
+
+        // ── SCHEDULED MAINTENANCE ────────────────────────────────────────
+        sectionHeader("Scheduled Maintenance")
+
+        let sCols: [Col] = [("Reminder", 160, .left), ("Interval", 110, .left), ("Last Completed", 120, .left), ("Status", 142, .left)]
+
+        if vehicle.reminders.isEmpty {
+            if needsBreak(16) { breakPage() }
+            let a: [NSAttributedString.Key: Any] = [.font: fBody, .foregroundColor: secondary]
+            ("No reminders scheduled." as NSString).draw(in: CGRect(x: margin, y: y, width: contentW, height: 16), withAttributes: a)
+            y += 22
+        } else {
+            let sorted = vehicle.reminders.sorted { reminderMilesUntilDue($0, currentMileage: vehicle.currentMileage) < reminderMilesUntilDue($1, currentMileage: vehicle.currentMileage) }
+            tableHeader(sCols)
+            for (i, r) in sorted.enumerated() {
+                let due = reminderMilesUntilDue(r, currentMileage: vehicle.currentMileage)
+                let intervalStr: String
+                if r.intervalType == .mileage, let mi = r.mileageInterval {
+                    intervalStr = "Every \(nf.string(from: NSNumber(value: mi)) ?? "\(mi)") \(vehicle.mileageUnit.label)"
+                } else if let freq = r.timeFrequency { intervalStr = freq.rawValue }
+                else { intervalStr = "—" }
+                let lastStr: String
+                if let d = r.lastCompletedDate { lastStr = df.string(from: d) }
+                else if let m = r.lastCompletedMileage {
+                    lastStr = "\(nf.string(from: NSNumber(value: m)) ?? "\(m)") \(vehicle.mileageUnit.label)"
+                } else { lastStr = "Never" }
+                let statusStr = due <= 0 ? "OVERDUE" : r.intervalType == .mileage
+                    ? "\(nf.string(from: NSNumber(value: due)) ?? "\(due)") \(vehicle.mileageUnit.label) left"
+                    : "Upcoming"
+                if needsBreak(18) { footerPageNum(); newPage(); tableHeader(sCols) }
+                tableRow([(r.title, 160, .left), (intervalStr, 110, .left), (lastStr, 120, .left), (statusStr, 142, .left)], idx: i, rowH: 18, redFlag: due <= 0)
+            }
+        }
+        y += 12
+
+        // ── MAINTENANCE HISTORY ──────────────────────────────────────────
+        if needsBreak(60) { footerPageNum(); newPage() }
+        sectionHeader("Maintenance History")
+
+        let notesColW: CGFloat = 188
+        let lCols: [Col] = [("Date", 74, .left), ("Service", 158, .left), ("Mileage", 70, .right), ("Cost", 62, .right), ("Notes", notesColW, .left)]
+        let logs = vehicle.maintenanceLogs.sorted { $0.date > $1.date }
+
+        if logs.isEmpty {
+            if needsBreak(16) { breakPage() }
+            let a: [NSAttributedString.Key: Any] = [.font: fBody, .foregroundColor: secondary]
+            ("No maintenance records yet." as NSString).draw(in: CGRect(x: margin, y: y, width: contentW, height: 16), withAttributes: a)
+            y += 16
+        } else {
+            func notesRowHeight(_ text: String) -> CGFloat {
+                guard !text.isEmpty else { return 18 }
+                let para = NSMutableParagraphStyle(); para.lineBreakMode = .byWordWrapping
+                let bounds = (text as NSString).boundingRect(
+                    with: CGSize(width: notesColW - 8, height: .greatestFiniteMagnitude),
+                    options: [.usesLineFragmentOrigin, .usesFontLeading],
+                    attributes: [.font: fBody, .paragraphStyle: para], context: nil)
+                return max(18, min(ceil(bounds.height) + 8, 72))
+            }
+            tableHeader(lCols)
+            for (i, log) in logs.enumerated() {
+                let notes = log.notes.replacingOccurrences(of: "• ", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                let rowH = notesRowHeight(notes)
+                if needsBreak(rowH) { footerPageNum(); newPage(); tableHeader(lCols) }
+                let mStr = vehicle.mileageUnit == .none ? "—" : (nf.string(from: NSNumber(value: log.mileage)) ?? "\(log.mileage)")
+                let cStr = log.totalCost > 0 ? String(format: "$%.2f", log.totalCost) : "—"
+                tableRow([(df.string(from: log.date), 74, .left), (log.serviceType, 158, .left), (mStr, 70, .right), (cStr, 62, .right), (notes, notesColW, .left)], idx: i, rowH: rowH)
+            }
+        }
+        footerPageNum()
+    }
+
+    return PDFReport(name: "\(vehicle.displayName)_Report", data: pdfData)
+}
+#endif
 
 #Preview {
     let vehicle = Vehicle(name: "Test Car", year: 2024, make: "Test", model: "Car")

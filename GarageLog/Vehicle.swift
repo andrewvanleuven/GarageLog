@@ -1,6 +1,22 @@
 import Foundation
 import SwiftData
 
+enum MileageUnit: String, Codable {
+    case miles = "miles"
+    case hours = "hours"
+    case none = "none"
+
+    var label: String {
+        switch self {
+        case .miles: return "mi"
+        case .hours: return "hr"
+        case .none: return ""
+        }
+    }
+
+    var tracksMileage: Bool { self != .none }
+}
+
 @Model
 final class Vehicle {
     var name: String
@@ -15,6 +31,12 @@ final class Vehicle {
     var currentMileage: Int = 0
     var sortOrder: Int = 0
     var gasFillupDisabled: Bool = false
+    var mileageUnitRaw: String = "miles"
+
+    var mileageUnit: MileageUnit {
+        get { MileageUnit(rawValue: mileageUnitRaw) ?? .miles }
+        set { mileageUnitRaw = newValue.rawValue }
+    }
     
     @Relationship(deleteRule: .cascade, inverse: \MaintenanceLog.vehicle)
     var maintenanceLogs: [MaintenanceLog] = []

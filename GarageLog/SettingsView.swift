@@ -6,6 +6,7 @@ import UserNotifications
 
 struct SettingsView: View {
     @Query private var vehicles: [Vehicle]
+    @Environment(\.modelContext) private var modelContext
     @AppStorage("accentColorName") private var accentColorName: String = "blue"
     @AppStorage("customAccentColorHex") private var customAccentColorHex: String = ""
     @AppStorage("isDarkMode") private var isDarkMode: Bool = true
@@ -16,8 +17,14 @@ struct SettingsView: View {
     @AppStorage("historicFuelWindow") private var historicFuelWindow: String = "6months"
     @AppStorage("logReminderDays") private var logReminderDays: Int = 15
     @AppStorage("notificationsEnabled") private var notificationsEnabled: Bool = true
+    @AppStorage("showNextUpBulletin") private var showNextUpBulletin: Bool = true
 
     @State private var notifStatus: UNAuthorizationStatus = .notDetermined
+    @State private var showingRestoreImporter = false
+    @State private var restoreResultMessage = ""
+    @State private var showingRestoreResult = false
+    @State private var pendingRestoreURL: URL?
+    @State private var showingRestoreModeDialog = false
     @Environment(\.openURL) private var openURL
 
     let colorOptions: [(name: String, color: Color)] = [
@@ -46,6 +53,26 @@ struct SettingsView: View {
         .onChange(of: logReminderDays) { _, days in
             NotificationManager.shared.scheduleLogReminder(daysFromNow: days)
         }
+        .fileImporter(isPresented: $showingRestoreImporter, allowedContentTypes: [.commaSeparatedText]) { result in
+            switch result {
+            case .success(let url): pendingRestoreURL = url; showingRestoreModeDialog = true
+            case .failure: restoreResultMessage = "Could not open file."; showingRestoreResult = true
+            }
+        }
+        .confirmationDialog("Restore Mode", isPresented: $showingRestoreModeDialog, titleVisibility: .visible) {
+            Button("Merge — Skip Duplicates") {
+                if let url = pendingRestoreURL { importGarageBackup(from: url, mode: .merge) }
+            }
+            Button("Fresh Restore — Wipe & Replace", role: .destructive) {
+                if let url = pendingRestoreURL { importGarageBackup(from: url, mode: .fresh) }
+            }
+            Button("Cancel", role: .cancel) { pendingRestoreURL = nil }
+        } message: {
+            Text("How would you like to restore this backup?")
+        }
+        .alert("Restore Complete", isPresented: $showingRestoreResult) {
+            Button("OK", role: .cancel) { }
+        } message: { Text(restoreResultMessage) }
         #else
         Form {
             appearanceSection
@@ -63,6 +90,26 @@ struct SettingsView: View {
         .onChange(of: logReminderDays) { _, days in
             NotificationManager.shared.scheduleLogReminder(daysFromNow: days)
         }
+        .fileImporter(isPresented: $showingRestoreImporter, allowedContentTypes: [.commaSeparatedText]) { result in
+            switch result {
+            case .success(let url): pendingRestoreURL = url; showingRestoreModeDialog = true
+            case .failure: restoreResultMessage = "Could not open file."; showingRestoreResult = true
+            }
+        }
+        .confirmationDialog("Restore Mode", isPresented: $showingRestoreModeDialog, titleVisibility: .visible) {
+            Button("Merge — Skip Duplicates") {
+                if let url = pendingRestoreURL { importGarageBackup(from: url, mode: .merge) }
+            }
+            Button("Fresh Restore — Wipe & Replace", role: .destructive) {
+                if let url = pendingRestoreURL { importGarageBackup(from: url, mode: .fresh) }
+            }
+            Button("Cancel", role: .cancel) { pendingRestoreURL = nil }
+        } message: {
+            Text("How would you like to restore this backup?")
+        }
+        .alert("Restore Complete", isPresented: $showingRestoreResult) {
+            Button("OK", role: .cancel) { }
+        } message: { Text(restoreResultMessage) }
         #endif
     }
 
@@ -98,6 +145,7 @@ struct SettingsView: View {
     private var appearanceSection: some View {
         Section("Appearance") {
             Toggle("Dark Mode", isOn: $isDarkMode)
+            Toggle("Show \"Next Up\" Bulletin", isOn: $showNextUpBulletin)
 
             LabeledContent("Accent Color") {
                 HStack(spacing: 10) {
@@ -252,21 +300,53 @@ struct SettingsView: View {
     }
 
     private var dataSection: some View {
-        Section("Data Management") {
-            ShareLink(item: allDataCSV, preview: SharePreview("GarageLog Export.csv", image: Image(systemName: "tablecells"))) {
-                Label("Export All Logs (CSV)", systemImage: "square.and.arrow.up")
-                    .foregroundStyle(Color.fromName(accentColorName))
+        let accent = Color.fromName(accentColorName)
+        let photoURLs = vehiclePhotoURLs
+        return Section("Data Management") {
+            ShareLink(item: garageBackupCSV, preview: SharePreview("GarageLog_Backup.csv", image: Image(systemName: "externaldrive"))) {
+                Label("Back Up Garage", systemImage: "square.and.arrow.up")
+                    .foregroundStyle(accent)
             }
 
-            ShareLink(item: logTemplateCSV, preview: SharePreview("GarageLog_Log_Template.csv", image: Image(systemName: "doc.badge.plus"))) {
-                Label("Export Maintenance Log Template", systemImage: "doc.badge.plus")
-                    .foregroundStyle(Color.fromName(accentColorName))
+            Button {
+                showingRestoreImporter = true
+            } label: {
+                Label("Restore from Backup", systemImage: "square.and.arrow.down")
+                    .foregroundStyle(accent)
             }
 
-            ShareLink(item: scheduleTemplateCSV, preview: SharePreview("GarageLog_Schedule_Template.csv", image: Image(systemName: "calendar.badge.plus"))) {
-                Label("Export Schedule Template", systemImage: "calendar.badge.plus")
-                    .foregroundStyle(Color.fromName(accentColorName))
+            if !photoURLs.isEmpty {
+                ShareLink(items: photoURLs, preview: { url in
+                    SharePreview(url.deletingPathExtension().lastPathComponent, image: Image(systemName: "photo"))
+                }) {
+                    Label("Export Vehicle Photos (\(photoURLs.count))", systemImage: "photo.on.rectangle.angled")
+                        .foregroundStyle(accent)
+                }
             }
+
+            Menu {
+                ShareLink(item: logTemplateCSV, preview: SharePreview("GarageLog_Log_Template.csv", image: Image(systemName: "doc.badge.plus"))) {
+                    Label("Log Template", systemImage: "doc.badge.plus")
+                }
+                ShareLink(item: scheduleTemplateCSV, preview: SharePreview("GarageLog_Schedule_Template.csv", image: Image(systemName: "calendar.badge.plus"))) {
+                    Label("Schedule Template", systemImage: "calendar.badge.plus")
+                }
+            } label: {
+                Label("Export Import Template", systemImage: "doc.badge.arrow.up")
+                    .foregroundStyle(accent)
+            }
+        }
+    }
+
+    private var vehiclePhotoURLs: [URL] {
+        let dir = FileManager.default.temporaryDirectory.appendingPathComponent("gl-photos", isDirectory: true)
+        try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        return vehicles.compactMap { v in
+            guard let data = v.imageData else { return nil }
+            let safeName = v.displayName.filter { $0.isLetter || $0.isNumber || $0 == " " }
+            let url = dir.appendingPathComponent(safeName).appendingPathExtension("jpg")
+            try? data.write(to: url)
+            return url
         }
     }
 
@@ -282,53 +362,164 @@ struct SettingsView: View {
     // MARK: - CSV data
 
     private var logTemplateCSV: CSVReport {
-        let content = """
-        Date,Type,Mileage,Gallons,Parts Cost,Labor Cost,Total Cost,Notes
-        1/15/2022,"Oil Change",45230,,15.99,0,15.99,"Valvoline 5W-30 full synthetic, OEM filter"
-        3/22/2022,"Tire Rotation",46100,,0,25.00,25.00,""
-        6/1/2022,"Brake Service",47500,,89.99,150.00,239.99,"Front pads and rotors replaced"
-        8/10/2022,"Battery Replacement",48200,,189.99,0,189.99,"Interstate 24F-3 — 3yr/100k warranty"
-        11/5/2022,"Gas Fill-up",49100,12.531,,,47.50,""
-        """
-        return CSVReport(name: "GarageLog_Log_Template", content: content)
+        // Cols: RecordType(0) | Nickname-CurrentMileage(1-8) | Date(9) | ServiceType(10) | Mileage(11) |
+        //       Gallons(12) | PartsCost(13) | LaborCost(14) | TotalCost(15) | Notes(16) | SkippedPrevious(17)
+        let rows = [
+            "log,\"My Car\",2020,\"Toyota\",\"Camry\",\"\",\"\",true,49100,1/15/22,\"Oil Change\",45230,,15.99,0,15.99,\"Valvoline 5W-30, OEM filter\"",
+            "log,\"My Car\",2020,\"Toyota\",\"Camry\",\"\",\"\",true,49100,3/22/22,\"Tire Rotation\",46100,,0,25.00,25.00,\"\"",
+            "log,\"My Car\",2020,\"Toyota\",\"Camry\",\"\",\"\",true,49100,6/1/22,\"Brake Service\",47500,,89.99,150.00,239.99,\"Front pads and rotors\"",
+            "fillup,\"My Car\",2020,\"Toyota\",\"Camry\",\"\",\"\",true,49100,11/5/22,,49100,12.531,,,47.50,\"\",false",
+        ].joined(separator: "\n")
+        return CSVReport(name: "GarageLog_Log_Template", content: garageCSVHeader() + rows + "\n")
     }
 
     private var scheduleTemplateCSV: CSVReport {
-        let content = """
-        Title,Interval Type,Frequency,Mileage Interval,Month Interval,Notes
-        "Oil Change",mileage,,5000,0,"0W-20 full synthetic"
-        "Tire Rotation",mileage,,5000,0,""
-        "Air Filter",mileage,,30000,0,""
-        "Cabin Filter",mileage,,15000,0,""
-        "Spark Plugs",mileage,,60000,0,"Iridium plugs"
-        "Snow Tires",time,Annual,0,10,"Install October — remove April"
-        "Inspection",time,Annual,0,6,""
-        """
-        return CSVReport(name: "GarageLog_Schedule_Template", content: content)
+        // Cols: RecordType(0) | Nickname-CurrentMileage(1-8) | Date(9-blank) | ServiceType(10=title) |
+        //       Mileage-SkippedPrevious(11-17 blank) | IntervalType(18) | Frequency(19) |
+        //       MileageInterval(20) | MonthInterval(21) | LastCompletedMileage(22) |
+        //       LastCompletedDate(23) | NextReminderMileage(24) | NextReminderDate(25)
+        let rows = [
+            "reminder,\"My Car\",2020,\"Toyota\",\"Camry\",\"\",\"\",true,49100,,\"Oil Change\",,,,,,,\"0W-20 full synthetic\",,mileage,,5000,0,,,",
+            "reminder,\"My Car\",2020,\"Toyota\",\"Camry\",\"\",\"\",true,49100,,\"Tire Rotation\",,,,,,,,mileage,,5000,0,,,",
+            "reminder,\"My Car\",2020,\"Toyota\",\"Camry\",\"\",\"\",true,49100,,\"Spark Plugs\",,,,,,,\"Iridium plugs\",mileage,,60000,0,,,",
+            "reminder,\"My Car\",2020,\"Toyota\",\"Camry\",\"\",\"\",true,49100,,\"Snow Tires\",,,,,,,\"Install Oct — remove Apr\",time,Annual,,10,,,",
+            "reminder,\"My Car\",2020,\"Toyota\",\"Camry\",\"\",\"\",true,49100,,\"Inspection\",,,,,,,,time,Annual,,6,,,",
+        ].joined(separator: "\n")
+        return CSVReport(name: "GarageLog_Schedule_Template", content: garageCSVHeader() + rows + "\n")
     }
 
-    private var allDataCSV: CSVReport {
-        let dateFormatter = DateFormatter()
-        dateFormatter.dateStyle = .short
-        var csvString = "Vehicle,Date,Type,Mileage,Gallons,Parts Cost,Labor Cost,Total Cost,Notes\n"
-
-        for vehicle in vehicles {
-            let vName = vehicle.name.replacingOccurrences(of: "\"", with: "\"\"")
-            var entries: [(date: Date, row: String)] = []
-
-            for log in vehicle.maintenanceLogs {
-                let notes = log.notes.replacingOccurrences(of: "\"", with: "\"\"")
-                let service = log.serviceType.replacingOccurrences(of: "\"", with: "\"\"")
-                entries.append((log.date, "\"\(vName)\",\(dateFormatter.string(from: log.date)),\"\(service)\",\(log.mileage),,\(log.partsCost),\(log.laborCost),\(log.totalCost),\"\(notes)\"\n"))
-            }
-            for fillup in vehicle.gasFillups {
-                entries.append((fillup.date, "\"\(vName)\",\(dateFormatter.string(from: fillup.date)),\"Gas Fill-up\",\(fillup.mileage),\(String(format: "%.3f", fillup.gallons)),,,\(String(format: "%.2f", fillup.totalCost)),\"\"\n"))
-            }
-
-            entries.sort { $0.date > $1.date }
-            for entry in entries { csvString.append(entry.row) }
+    private var garageBackupCSV: CSVReport {
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        df.dateFormat = "M/d/yy"
+        var content = garageCSVHeader()
+        for v in vehicles.sorted(by: { $0.displayName < $1.displayName }) {
+            content += vehicleCSVRows(v, using: df)
         }
-        return CSVReport(name: "GarageLog_All_Data", content: csvString)
+        return CSVReport(name: "GarageLog_Backup", content: content)
+    }
+
+    private func importGarageBackup(from url: URL, mode: ImportMode) {
+        guard url.startAccessingSecurityScopedResource() else {
+            restoreResultMessage = "Permission denied for file."
+            showingRestoreResult = true
+            return
+        }
+        defer { url.stopAccessingSecurityScopedResource() }
+        guard let content = try? String(contentsOf: url, encoding: .utf8) else {
+            restoreResultMessage = "Could not read file."
+            showingRestoreResult = true
+            return
+        }
+        let rows = parseCSV(content)
+        guard rows.count > 1 else {
+            restoreResultMessage = "No records found in file."
+            showingRestoreResult = true
+            return
+        }
+        let headers = rows[0].map { $0.lowercased().trimmingCharacters(in: .whitespaces) }
+        guard headers.first == "recordtype" else {
+            restoreResultMessage = "Unrecognized format. Only the universal backup format is supported for garage restore."
+            showingRestoreResult = true
+            return
+        }
+
+        if mode == .fresh {
+            for v in vehicles { modelContext.delete(v) }
+            try? modelContext.save()
+        }
+
+        func col(_ row: [String], _ idx: Int?) -> String {
+            guard let idx, row.indices.contains(idx) else { return "" }
+            return row[idx].trimmingCharacters(in: .whitespaces)
+        }
+        let df = DateFormatter()
+        df.locale = Locale(identifier: "en_US_POSIX")
+        let fmts = ["M/d/yy", "M/d/yyyy", "MM/dd/yy", "MM/dd/yyyy", "yyyy-MM-dd"]
+        func parseDate(_ s: String) -> Date? {
+            for fmt in fmts { df.dateFormat = fmt; if let d = df.date(from: s.trimmingCharacters(in: .whitespaces)) { return d } }
+            return nil
+        }
+
+        var workingVehicles: [Vehicle] = mode == .fresh ? [] : vehicles
+
+        func findOrCreate(nickname: String, year: Int, make: String, model: String,
+                          vin: String, plate: String, trackFuel: Bool) -> Vehicle {
+            if !vin.isEmpty, let v = workingVehicles.first(where: { !$0.vin.isEmpty && $0.vin.uppercased() == vin.uppercased() }) { return v }
+            if let v = workingVehicles.first(where: { $0.make.lowercased() == make.lowercased() && $0.model.lowercased() == model.lowercased() && $0.year == year }) { return v }
+            let v = Vehicle(name: nickname, year: year, make: make, model: model,
+                            licensePlate: plate.uppercased(), vin: vin.uppercased())
+            v.gasFillupDisabled = !trackFuel
+            modelContext.insert(v)
+            workingVehicles.append(v)
+            return v
+        }
+
+        let cal = Calendar.current
+        var imported = 0
+        for row in rows.dropFirst() {
+            let year = Int(col(row, 2)) ?? 2000
+            let trackFuel = col(row, 7).lowercased() != "false"
+            let vehicle = findOrCreate(
+                nickname: col(row, 1), year: year, make: col(row, 3), model: col(row, 4),
+                vin: col(row, 5), plate: col(row, 6), trackFuel: trackFuel)
+
+            switch col(row, 0).lowercased() {
+            case "log":
+                guard let date = parseDate(col(row, 9)) else { continue }
+                let svc = col(row, 10); guard !svc.isEmpty else { continue }
+                let mileage = Int(col(row, 11)) ?? 0
+                if mode == .merge {
+                    let dup = vehicle.maintenanceLogs.contains { cal.isDate($0.date, inSameDayAs: date) && $0.serviceType == svc && $0.mileage == mileage }
+                    if dup { continue }
+                }
+                let log = MaintenanceLog(date: date, mileage: mileage, serviceType: svc,
+                    notes: col(row, 16),
+                    partsCost: Double(col(row, 13)) ?? 0, laborCost: Double(col(row, 14)) ?? 0)
+                log.vehicle = vehicle; vehicle.maintenanceLogs.append(log)
+                if mileage > vehicle.currentMileage { vehicle.currentMileage = mileage }
+                imported += 1
+            case "fillup":
+                guard let date = parseDate(col(row, 9)) else { continue }
+                let gallons = Double(col(row, 12)) ?? 0; guard gallons > 0 else { continue }
+                let mileage = Int(col(row, 11)) ?? 0
+                if mode == .merge {
+                    let dup = vehicle.gasFillups.contains { cal.isDate($0.date, inSameDayAs: date) && $0.mileage == mileage }
+                    if dup { continue }
+                }
+                let fillup = GasFillup(date: date, mileage: mileage, gallons: gallons,
+                    totalCost: Double(col(row, 15)) ?? 0,
+                    skippedPrevious: col(row, 17).lowercased() == "true")
+                fillup.vehicle = vehicle; vehicle.gasFillups.append(fillup)
+                if mileage > vehicle.currentMileage { vehicle.currentMileage = mileage }
+                imported += 1
+            case "reminder":
+                let title = col(row, 10); guard !title.isEmpty else { continue }
+                if mode == .merge {
+                    let dup = vehicle.reminders.contains { $0.title.lowercased() == title.lowercased() }
+                    if dup { continue }
+                }
+                let itype = ReminderIntervalType(rawValue: col(row, 18)) ?? .mileage
+                let mi = Int(col(row, 20)).flatMap { $0 > 0 ? $0 : nil }
+                let mo = Int(col(row, 21)).flatMap { $0 > 0 ? $0 : nil }
+                let n = col(row, 16)
+                let reminder = MaintenanceReminder(title: title, intervalType: itype,
+                    timeFrequency: TimeFrequency(rawValue: col(row, 19)),
+                    mileageInterval: mi, monthInterval: mo, notes: n.isEmpty ? "• " : n)
+                reminder.lastCompletedMileage = Int(col(row, 22))
+                reminder.lastCompletedDate    = parseDate(col(row, 23))
+                reminder.nextReminderMileage  = Int(col(row, 24))
+                reminder.nextReminderDate     = parseDate(col(row, 25))
+                reminder.vehicle = vehicle; vehicle.reminders.append(reminder)
+                imported += 1
+            default: continue
+            }
+        }
+
+        for v in workingVehicles { v.lastModified = Date() }
+        try? modelContext.save()
+        restoreResultMessage = imported > 0 ? "Restored \(imported) record\(imported == 1 ? "" : "s") across \(workingVehicles.count) vehicle\(workingVehicles.count == 1 ? "" : "s")." : "No valid records found."
+        showingRestoreResult = true
     }
 }
 
@@ -399,6 +590,16 @@ struct HistoricFuelCostsView: View {
                             AxisMarks(values: .automatic) { _ in
                                 AxisGridLine()
                                 AxisValueLabel(format: .dateTime.month(.abbreviated).day())
+                            }
+                        }
+                        .chartYAxis {
+                            AxisMarks(values: .automatic) { value in
+                                AxisGridLine()
+                                AxisValueLabel {
+                                    if let d = value.as(Double.self) {
+                                        Text("$\(d, specifier: "%.2f")")
+                                    }
+                                }
                             }
                         }
                         .onTapGesture { cycleWindow() }

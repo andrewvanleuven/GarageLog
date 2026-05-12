@@ -9,6 +9,8 @@ struct ReminderNotifData {
     let currentMileage: Int
     let timeFrequency: TimeFrequency?
     let monthInterval: Int?
+    let nextReminderMileage: Int?
+    let nextReminderDate: Date?
 
     var notifPrefix: String {
         let safe = "\(vehicleName)-\(title)".lowercased()
@@ -45,7 +47,8 @@ class NotificationManager {
         switch r.intervalType {
         case .mileage:
             guard let interval = r.mileageInterval else { return }
-            let remaining = (r.lastCompletedMileage ?? 0) + interval - r.currentMileage
+            let dueAt = r.nextReminderMileage ?? ((r.lastCompletedMileage ?? 0) + interval)
+            let remaining = dueAt - r.currentMileage
             guard remaining <= 500 else { return }
 
             let content = UNMutableNotificationContent()
@@ -62,6 +65,18 @@ class NotificationManager {
             UNUserNotificationCenter.current().add(request, withCompletionHandler: nil)
 
         case .time:
+            if let nextDate = r.nextReminderDate {
+                let content = UNMutableNotificationContent()
+                content.title = "\(r.title) Due"
+                content.body = "\(r.vehicleName) — \(r.title) is due."
+                content.sound = .default
+                var dc = Calendar.current.dateComponents([.year, .month, .day], from: nextDate)
+                dc.hour = 9
+                let trigger = UNCalendarNotificationTrigger(dateMatching: dc, repeats: false)
+                let req = UNNotificationRequest(identifier: "\(r.notifPrefix)-pinned", content: content, trigger: trigger)
+                UNUserNotificationCenter.current().add(req, withCompletionHandler: nil)
+                return
+            }
             guard let freq = r.timeFrequency else { return }
             let start = r.monthInterval ?? 1
             let months: [Int]

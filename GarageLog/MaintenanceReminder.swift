@@ -10,6 +10,8 @@ final class MaintenanceReminder {
     var monthInterval: Int?
     var lastCompletedMileage: Int?
     var lastCompletedDate: Date?
+    var nextReminderMileage: Int?
+    var nextReminderDate: Date?
     var notes: String
     var vehicle: Vehicle?
     

@@ -5,7 +5,7 @@
 <h1 align="center">GarageLog</h1>
 
 <p align="center">
-  A bespoke personal vehicle maintenance tracker for iOS and macOS.
+  A personal vehicle maintenance tracker for iOS and macOS.
 </p>
 
 ---

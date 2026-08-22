@@ -19,34 +19,53 @@ enum MileageUnit: String, Codable {
 
 @Model
 final class Vehicle {
-    var name: String
-    var year: Int
-    var make: String
-    var model: String
-    var licensePlate: String
-    var vin: String
+    var name: String = ""
+    var year: Int = 2024
+    var make: String = ""
+    var model: String = ""
+    var licensePlate: String = ""
+    var vin: String = ""
     var imageData: Data?
-    var isPinned: Bool
-    var lastModified: Date
+    var isPinned: Bool = false
+    var lastModified: Date = Date()
     var currentMileage: Int = 0
     var sortOrder: Int = 0
     var gasFillupDisabled: Bool = false
     var mileageUnitRaw: String = "miles"
+    var isRetired: Bool = false
 
     var mileageUnit: MileageUnit {
         get { MileageUnit(rawValue: mileageUnitRaw) ?? .miles }
         set { mileageUnitRaw = newValue.rawValue }
     }
     
+    // Stored as Optional because CloudKit integration requires ALL relationships
+    // (including to-many) to be optional. The non-optional computed properties
+    // below keep every existing call site working unchanged.
     @Relationship(deleteRule: .cascade, inverse: \MaintenanceLog.vehicle)
-    var maintenanceLogs: [MaintenanceLog] = []
-    
+    var maintenanceLogsStorage: [MaintenanceLog]?
+
     @Relationship(deleteRule: .cascade, inverse: \MaintenanceReminder.vehicle)
-    var reminders: [MaintenanceReminder] = []
+    var remindersStorage: [MaintenanceReminder]?
 
     @Relationship(deleteRule: .cascade, inverse: \GasFillup.vehicle)
-    var gasFillups: [GasFillup] = []
-    
+    var gasFillupsStorage: [GasFillup]?
+
+    var maintenanceLogs: [MaintenanceLog] {
+        get { maintenanceLogsStorage ?? [] }
+        set { maintenanceLogsStorage = newValue }
+    }
+
+    var reminders: [MaintenanceReminder] {
+        get { remindersStorage ?? [] }
+        set { remindersStorage = newValue }
+    }
+
+    var gasFillups: [GasFillup] {
+        get { gasFillupsStorage ?? [] }
+        set { gasFillupsStorage = newValue }
+    }
+
     var displayName: String {
         name.isEmpty ? "\(make) \(model)" : name
     }

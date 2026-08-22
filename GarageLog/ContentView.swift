@@ -24,10 +24,11 @@ struct ContentView: View {
     }
 
     var sortedVehicles: [Vehicle] {
+        let active = vehicles.filter { !$0.isRetired }
         switch sortType {
-        case .lastModified: return vehicles.sorted { $0.lastModified > $1.lastModified }
-        case .nameAZ:       return vehicles.sorted { $0.name < $1.name }
-        case .customOrder:  return vehicles.sorted { $0.sortOrder < $1.sortOrder }
+        case .lastModified: return active.sorted { $0.lastModified > $1.lastModified }
+        case .nameAZ:       return active.sorted { $0.name < $1.name }
+        case .customOrder:  return active.sorted { $0.sortOrder < $1.sortOrder }
         }
     }
 
@@ -59,6 +60,15 @@ struct ContentView: View {
                     VehicleSidebarRow(vehicle: vehicle)
                         .tag(vehicle.persistentModelID)
                         .contextMenu {
+                            Button {
+                                vehicle.isRetired = true
+                                NotificationManager.shared.refresh(vehicleName: vehicle.displayName, currentMileage: vehicle.currentMileage, reminders: [])
+                                if selectedVehicleID == vehicle.persistentModelID { selectedVehicleID = nil }
+                                try? modelContext.save()
+                            } label: {
+                                Label("Retire Vehicle", systemImage: "archivebox")
+                            }
+                            Divider()
                             Button(role: .destructive) {
                                 if selectedVehicleID == vehicle.persistentModelID { selectedVehicleID = nil }
                                 modelContext.delete(vehicle)
@@ -70,7 +80,7 @@ struct ContentView: View {
                 }
             }
             .overlay {
-                if vehicles.isEmpty {
+                if sortedVehicles.isEmpty {
                     ContentUnavailableView {
                         Label("Empty Garage", systemImage: "car.side.fill")
                     } description: {
@@ -141,7 +151,7 @@ struct ContentView: View {
     private var iosBody: some View {
         NavigationStack {
             Group {
-                if vehicles.isEmpty {
+                if sortedVehicles.isEmpty {
                     ContentUnavailableView {
                         Label("Your Garage is Empty", systemImage: "car.side.fill")
                     } description: {
@@ -171,6 +181,14 @@ struct ContentView: View {
                                         }
                                         Divider()
                                     }
+                                    Button {
+                                        vehicle.isRetired = true
+                                        NotificationManager.shared.refresh(vehicleName: vehicle.displayName, currentMileage: vehicle.currentMileage, reminders: [])
+                                        try? modelContext.save()
+                                    } label: {
+                                        Label("Retire Vehicle", systemImage: "archivebox")
+                                    }
+                                    Divider()
                                     Button(role: .destructive) {
                                         modelContext.delete(vehicle)
                                         try? modelContext.save()
@@ -195,6 +213,13 @@ struct ContentView: View {
                         }
                     } label: {
                         Image(systemName: "arrow.up.arrow.down")
+                    }
+                }
+                if sortType == .customOrder {
+                    ToolbarItem(placement: .topBarLeading) {
+                        Button { showingReorderSheet = true } label: {
+                            Image(systemName: "pencil.and.list.clipboard")
+                        }
                     }
                 }
                 ToolbarItem(placement: .topBarTrailing) {
@@ -259,7 +284,9 @@ struct ContentView: View {
                     try? modelContext.save()
                 }
             }
+            #if os(iOS)
             .environment(\.editMode, .constant(.active))
+            #endif
             .navigationTitle("Custom Order")
             .toolbar {
                 ToolbarItem(placement: .confirmationAction) {

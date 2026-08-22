@@ -3,8 +3,8 @@ import SwiftData
 
 @Model
 final class MaintenanceReminder {
-    var title: String
-    var intervalType: ReminderIntervalType
+    var title: String = ""
+    var intervalType: ReminderIntervalType = ReminderIntervalType.mileage
     var timeFrequency: TimeFrequency?
     var mileageInterval: Int?
     var monthInterval: Int?
@@ -12,7 +12,7 @@ final class MaintenanceReminder {
     var lastCompletedDate: Date?
     var nextReminderMileage: Int?
     var nextReminderDate: Date?
-    var notes: String
+    var notes: String = ""
     var vehicle: Vehicle?
     
     init(title: String = "", intervalType: ReminderIntervalType = .mileage, timeFrequency: TimeFrequency? = nil, mileageInterval: Int? = nil, monthInterval: Int? = nil, notes: String = "• ") {

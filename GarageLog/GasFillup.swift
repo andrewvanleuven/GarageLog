@@ -3,10 +3,10 @@ import SwiftData
 
 @Model
 final class GasFillup {
-    var date: Date
-    var mileage: Int
-    var gallons: Double
-    var totalCost: Double
+    var date: Date = Date()
+    var mileage: Int = 0
+    var gallons: Double = 0
+    var totalCost: Double = 0
     // True when the user didn't log the fillup immediately before this one;
     // consecutive-pair MPG is skipped for this entry.
     var skippedPrevious: Bool = false

@@ -3,12 +3,12 @@ import SwiftData
 
 @Model
 final class MaintenanceLog {
-    var date: Date
-    var mileage: Int
-    var serviceType: String
-    var notes: String
-    var partsCost: Double
-    var laborCost: Double
+    var date: Date = Date()
+    var mileage: Int = 0
+    var serviceType: String = ""
+    var notes: String = ""
+    var partsCost: Double = 0.0
+    var laborCost: Double = 0.0
     var vehicle: Vehicle?
     var receiptPhotoData: Data? = nil
 

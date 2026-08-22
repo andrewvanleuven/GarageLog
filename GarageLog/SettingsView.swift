@@ -18,6 +18,11 @@ struct SettingsView: View {
     @AppStorage("logReminderDays") private var logReminderDays: Int = 15
     @AppStorage("notificationsEnabled") private var notificationsEnabled: Bool = true
     @AppStorage("showNextUpBulletin") private var showNextUpBulletin: Bool = true
+    #if os(iOS)
+    @AppStorage("iconCycleMode") private var iconCycleMode: IconCycleMode = .fixed
+    @AppStorage("fixedIconCar") private var fixedIconCar: String = AppIconManager.defaultCar
+    @AppStorage("selectedIconCars") private var selectedIconCarsRaw: String = AppIconManager.allCars.joined(separator: ",")
+    #endif
 
     @State private var notifStatus: UNAuthorizationStatus = .notDetermined
     @State private var showingRestoreImporter = false
@@ -26,6 +31,7 @@ struct SettingsView: View {
     @State private var pendingRestoreURL: URL?
     @State private var showingRestoreModeDialog = false
     @Environment(\.openURL) private var openURL
+    @ObservedObject private var cloudSync = CloudSyncMonitor.shared
 
     let colorOptions: [(name: String, color: Color)] = [
         ("blue", .blue), ("red", .red), ("green", .green), ("orange", .orange),
@@ -76,8 +82,10 @@ struct SettingsView: View {
         #else
         Form {
             appearanceSection
+            appIconSection
             fuelSection
             notificationsSection
+            cloudSyncSection
             dataSection
             aboutSection
         }
@@ -135,8 +143,11 @@ struct SettingsView: View {
     }
 
     private var dataForm: some View {
-        Form { dataSection }
-            .padding()
+        Form {
+            cloudSyncSection
+            dataSection
+        }
+        .padding()
     }
     #endif
 
@@ -299,10 +310,67 @@ struct SettingsView: View {
         }
     }
 
+    private var cloudSyncSection: some View {
+        Section("iCloud Sync") {
+            HStack {
+                Image(systemName: cloudSyncIcon)
+                    .foregroundStyle(cloudSyncColor)
+                Text(cloudSyncStatusText)
+                    .foregroundStyle(.secondary)
+                Spacer()
+                if cloudSync.status == .syncing {
+                    ProgressView()
+                }
+            }
+        }
+    }
+
+    private var cloudSyncIcon: String {
+        switch cloudSync.status {
+        case .neverSynced: return "icloud.slash"
+        case .syncing: return "arrow.triangle.2.circlepath.icloud"
+        case .succeeded: return "checkmark.icloud"
+        case .failed: return "exclamationmark.icloud"
+        }
+    }
+
+    private var cloudSyncColor: Color {
+        switch cloudSync.status {
+        case .neverSynced: return .secondary
+        case .syncing: return .blue
+        case .succeeded: return .green
+        case .failed: return .red
+        }
+    }
+
+    private var cloudSyncStatusText: String {
+        switch cloudSync.status {
+        case .neverSynced: return "Not yet synced"
+        case .syncing: return "Syncing…"
+        case .succeeded(let date):
+            let fmt = RelativeDateTimeFormatter()
+            fmt.unitsStyle = .full
+            return "Synced \(fmt.localizedString(for: date, relativeTo: Date()))"
+        case .failed(let message): return "Sync error: \(message)"
+        }
+    }
+
     private var dataSection: some View {
         let accent = Color.fromName(accentColorName)
         let photoURLs = vehiclePhotoURLs
         return Section("Data Management") {
+            #if os(iOS)
+            let retiredCount = vehicles.filter { $0.isRetired }.count
+            if retiredCount > 0 {
+                NavigationLink {
+                    RetiredVehiclesView()
+                } label: {
+                    Label("Retired Vehicles (\(retiredCount))", systemImage: "archivebox")
+                        .foregroundStyle(accent)
+                }
+            }
+            #endif
+
             ShareLink(item: garageBackupCSV, preview: SharePreview("GarageLog_Backup.csv", image: Image(systemName: "externaldrive"))) {
                 Label("Back Up Garage", systemImage: "square.and.arrow.up")
                     .foregroundStyle(accent)
@@ -349,6 +417,16 @@ struct SettingsView: View {
             return url
         }
     }
+
+    #if os(iOS)
+    private var appIconSection: some View {
+        Section {
+            NavigationLink("App Icon") {
+                AppIconPickerView()
+            }
+        }
+    }
+    #endif
 
     private var aboutSection: some View {
         Section("About") {

@@ -32,6 +32,7 @@ struct VehicleDetailView: View {
     @AppStorage("mpgAverageWindow") private var mpgAverageWindow: String = "6months"
     @AppStorage("mpgTrendWindow") private var mpgTrendWindow: Int = 2
     @AppStorage("fuelViewMode") private var fuelViewMode: String = "economy"
+    @AppStorage("pdfIncludeCosts") private var pdfIncludeCosts: Bool = true
 
     @State private var showingAddLog = false
     @State private var showingAddFillup = false
@@ -44,6 +45,7 @@ struct VehicleDetailView: View {
     @State private var showingAddReminder = false
     @State private var showingClearSchedule = false
     @State private var showingScheduleSettings = false
+    @State private var showingRetireConfirm = false
     @State private var reminderToEdit: MaintenanceReminder?
     @State private var reminderToSetNext: MaintenanceReminder?
     @State private var showingFileImporter = false
@@ -456,7 +458,7 @@ struct VehicleDetailView: View {
 
                             if allVehicles.count > 1 {
                                 Menu("Import Schedule from...") {
-                                    ForEach(allVehicles.filter { $0.id != vehicle.id }) { other in
+                                    ForEach(allVehicles.filter { $0.id != vehicle.id && !$0.isRetired }) { other in
                                         Button(other.displayName) {
                                             importReminders(from: other)
                                         }
@@ -489,7 +491,7 @@ struct VehicleDetailView: View {
                             Label("Add first reminder...", systemImage: "plus.circle")
                         }
                         
-                        let otherVehicles = allVehicles.filter { $0.id != vehicle.id && !$0.reminders.isEmpty }
+                        let otherVehicles = allVehicles.filter { $0.id != vehicle.id && !$0.isRetired && !$0.reminders.isEmpty }
                         if !otherVehicles.isEmpty {
                             Menu {
                                 ForEach(otherVehicles) { other in
@@ -678,15 +680,66 @@ struct VehicleDetailView: View {
                     Label("Import / Export", systemImage: "arrow.up.arrow.down")
                 }
                 #if os(iOS)
-                if let pdfData = generateVehiclePDF(vehicle: vehicle) {
-                    ShareLink(item: pdfData, preview: SharePreview("\(vehicle.displayName) Report.pdf", image: Image(systemName: "doc.richtext"))) {
-                        Label("Export PDF Report", systemImage: "doc.richtext")
+                Menu {
+                    Section {
+                        if let pdfData = generateVehiclePDF(vehicle: vehicle, includeSchedule: true, includeLog: false, includeCosts: pdfIncludeCosts) {
+                            ShareLink(item: pdfData, preview: SharePreview("\(vehicle.displayName) Schedule.pdf", image: Image(systemName: "doc.richtext"))) {
+                                Label("Maintenance Schedule", systemImage: "calendar")
+                            }
+                        }
+                        if let pdfData = generateVehiclePDF(vehicle: vehicle, includeSchedule: false, includeLog: true, includeCosts: pdfIncludeCosts) {
+                            ShareLink(item: pdfData, preview: SharePreview("\(vehicle.displayName) Log.pdf", image: Image(systemName: "doc.richtext"))) {
+                                Label("Maintenance Log", systemImage: "wrench.and.screwdriver")
+                            }
+                        }
+                        if let pdfData = generateVehiclePDF(vehicle: vehicle, includeSchedule: true, includeLog: true, includeCosts: pdfIncludeCosts) {
+                            ShareLink(item: pdfData, preview: SharePreview("\(vehicle.displayName) Full Report.pdf", image: Image(systemName: "doc.richtext"))) {
+                                Label("Both (Full Report)", systemImage: "doc.text.below.ecg")
+                            }
+                        }
                     }
+                    Section {
+                        Toggle("Include Costs", isOn: $pdfIncludeCosts)
+                    }
+                } label: {
+                    Label("Export PDF Report", systemImage: "doc.richtext")
                 }
                 #endif
             } header: {
                 Text("Data")
             }
+
+            Section {
+                if vehicle.isRetired {
+                    Button {
+                        vehicle.isRetired = false
+                        refreshNotifications()
+                        try? modelContext.save()
+                    } label: {
+                        Label("Restore to Garage", systemImage: "arrow.uturn.backward")
+                    }
+                } else {
+                    Button {
+                        showingRetireConfirm = true
+                    } label: {
+                        Label("Retire Vehicle", systemImage: "archivebox")
+                    }
+                    .foregroundStyle(.orange)
+                }
+            }
+        }
+        .confirmationDialog(
+            "Retire \(vehicle.displayName)?",
+            isPresented: $showingRetireConfirm,
+            titleVisibility: .visible
+        ) {
+            Button("Retire", role: .destructive) {
+                vehicle.isRetired = true
+                NotificationManager.shared.refresh(vehicleName: vehicle.displayName, currentMileage: vehicle.currentMileage, reminders: [])
+                try? modelContext.save()
+            }
+        } message: {
+            Text("This hides it from your garage and cancels its reminders. All its history stays intact — find it anytime in Settings → Retired Vehicles.")
         }
         .navigationTitle(vehicle.displayName)
         .sheet(isPresented: $showingAddLog) {
@@ -1664,10 +1717,10 @@ struct AddGasFillupView: View {
     @State private var date = Date()
     @State private var mileageString = ""
     @State private var gallonsString = ""
-    @State private var totalCost: Double = 0.0
+    @State private var totalCostString = ""
     @State private var skippedPrevious = false
 
-    private enum Field: Hashable { case mileage, gallons }
+    private enum Field: Hashable, CaseIterable { case mileage, gallons, totalCost }
     @FocusState private var focus: Field?
 
     init(vehicles: [Vehicle], editingFillup: GasFillup? = nil) {
@@ -1677,20 +1730,37 @@ struct AddGasFillupView: View {
             _selectedVehicle = State(initialValue: fillup.vehicle ?? vehicles.first)
             _date = State(initialValue: fillup.date)
             _mileageString = State(initialValue: formatMileage(String(fillup.mileage)))
-            _gallonsString = State(initialValue: String(fillup.gallons))
-            _totalCost = State(initialValue: fillup.totalCost)
+            _gallonsString = State(initialValue: formatGallons(String(Int((fillup.gallons * 1000).rounded()))))
+            _totalCostString = State(initialValue: formatCost(String(Int((fillup.totalCost * 100).rounded()))))
             _skippedPrevious = State(initialValue: fillup.skippedPrevious)
         } else {
             _selectedVehicle = State(initialValue: vehicles.first)
         }
     }
 
+    private var gallons: Double {
+        Double(gallonsString.filter { $0.isNumber }).map { $0 / 1000 } ?? 0
+    }
+
+    private var totalCost: Double {
+        Double(totalCostString.filter { $0.isNumber }).map { $0 / 100 } ?? 0
+    }
 
     private var isValid: Bool {
         selectedVehicle != nil &&
         Int(mileageString.filter { $0.isNumber }) != nil &&
         !mileageString.filter({ $0.isNumber }).isEmpty &&
-        (Double(gallonsString) ?? 0) > 0
+        gallons > 0
+    }
+
+    private var previousField: Field? {
+        guard let focus, let idx = Field.allCases.firstIndex(of: focus), idx > 0 else { return nil }
+        return Field.allCases[idx - 1]
+    }
+
+    private var nextField: Field? {
+        guard let focus, let idx = Field.allCases.firstIndex(of: focus), idx < Field.allCases.count - 1 else { return nil }
+        return Field.allCases[idx + 1]
     }
 
     var body: some View {
@@ -1722,16 +1792,27 @@ struct AddGasFillupView: View {
                     }
 
                     LabeledContent("Gallons") {
-                        TextField("", text: $gallonsString)
+                        TextField("0.000", text: $gallonsString)
                             #if os(iOS)
-                            .keyboardType(.decimalPad)
+                            .keyboardType(.numberPad)
                             #endif
                             .multilineTextAlignment(.trailing)
                             .focused($focus, equals: .gallons)
+                            .onChange(of: gallonsString) { _, val in
+                                gallonsString = formatGallons(val)
+                            }
                     }
 
                     LabeledContent("Total Cost") {
-                        CurrencyTextField(value: $totalCost)
+                        TextField("$0.00", text: $totalCostString)
+                            #if os(iOS)
+                            .keyboardType(.numberPad)
+                            #endif
+                            .multilineTextAlignment(.trailing)
+                            .focused($focus, equals: .totalCost)
+                            .onChange(of: totalCostString) { _, val in
+                                totalCostString = formatCost(val)
+                            }
                     }
                 }
 
@@ -1754,18 +1835,17 @@ struct AddGasFillupView: View {
                 }
                 #if os(iOS)
                 ToolbarItemGroup(placement: .keyboard) {
-                    Button { focus = .mileage } label: { Image(systemName: "chevron.up") }
-                        .disabled(focus == .mileage)
-                    Button { focus = .gallons } label: { Image(systemName: "chevron.down") }
-                        .disabled(focus == .gallons)
+                    Button { if let previousField { focus = previousField } } label: { Image(systemName: "chevron.up") }
+                        .disabled(previousField == nil)
+                    Button { if let nextField { focus = nextField } } label: { Image(systemName: "chevron.down") }
+                        .disabled(nextField == nil)
                     Spacer()
                     Button("Done") { focus = nil }
                 }
                 #endif
                 ToolbarItem(placement: .confirmationAction) {
                     Button("Save") {
-                        guard let mileage = Int(mileageString.filter { $0.isNumber }),
-                              let gallons = Double(gallonsString) else { return }
+                        guard let mileage = Int(mileageString.filter { $0.isNumber }) else { return }
                         if let fillup = editingFillup {
                             fillup.date = date
                             fillup.mileage = mileage
@@ -2189,6 +2269,24 @@ func formatMileage(_ raw: String) -> String {
     return fmt.string(from: NSNumber(value: n)) ?? digits
 }
 
+/// ATM-style entry: digits shift in from the right with 3 implied decimal
+/// places, so typing "1034" reads as 1.034.
+func formatGallons(_ raw: String) -> String {
+    let digits = raw.filter { $0.isNumber }
+    guard !digits.isEmpty, let n = Int(digits) else { return "" }
+    let capped = min(n, 999_999)
+    return String(format: "%d.%03d", capped / 1000, capped % 1000)
+}
+
+/// ATM-style entry: digits shift in from the right with 2 implied decimal
+/// places (cents), so typing "150" reads as $1.50.
+func formatCost(_ raw: String) -> String {
+    let digits = raw.filter { $0.isNumber }
+    guard !digits.isEmpty, let n = Int(digits) else { return "" }
+    let capped = min(n, 9_999_999)
+    return String(format: "$%d.%02d", capped / 100, capped % 100)
+}
+
 func garageCSVHeader() -> String {
     "RecordType,Nickname,Year,Make,Model,VIN,LicensePlate,TrackFuel,CurrentMileage,Date,ServiceType,Mileage,Gallons,PartsCost,LaborCost,TotalCost,Notes,SkippedPrevious,IntervalType,Frequency,MileageInterval,MonthInterval,LastCompletedMileage,LastCompletedDate,NextReminderMileage,NextReminderDate\n"
 }
@@ -2289,7 +2387,7 @@ struct PDFReport: Transferable {
     }
 }
 
-func generateVehiclePDF(vehicle: Vehicle) -> PDFReport? {
+func generateVehiclePDF(vehicle: Vehicle, includeSchedule: Bool = true, includeLog: Bool = true, includeCosts: Bool = true) -> PDFReport? {
     let pageW: CGFloat = 612, pageH: CGFloat = 792, margin: CGFloat = 44
     let contentW = pageW - margin * 2
     let df = DateFormatter(); df.dateStyle = .medium; df.timeStyle = .none
@@ -2478,76 +2576,95 @@ func generateVehiclePDF(vehicle: Vehicle) -> PDFReport? {
         y += 10
 
         // ── SCHEDULED MAINTENANCE ────────────────────────────────────────
-        sectionHeader("Scheduled Maintenance")
+        if includeSchedule {
+            sectionHeader("Scheduled Maintenance")
 
-        let sCols: [Col] = [("Reminder", 160, .left), ("Interval", 110, .left), ("Last Completed", 120, .left), ("Status", 142, .left)]
+            let sCols: [Col] = [("Reminder", 160, .left), ("Interval", 110, .left), ("Last Completed", 120, .left), ("Status", 142, .left)]
 
-        if vehicle.reminders.isEmpty {
-            if needsBreak(16) { breakPage() }
-            let a: [NSAttributedString.Key: Any] = [.font: fBody, .foregroundColor: secondary]
-            ("No reminders scheduled." as NSString).draw(in: CGRect(x: margin, y: y, width: contentW, height: 16), withAttributes: a)
-            y += 22
-        } else {
-            let sorted = vehicle.reminders.sorted { reminderMilesUntilDue($0, currentMileage: vehicle.currentMileage) < reminderMilesUntilDue($1, currentMileage: vehicle.currentMileage) }
-            tableHeader(sCols)
-            for (i, r) in sorted.enumerated() {
-                let due = reminderMilesUntilDue(r, currentMileage: vehicle.currentMileage)
-                let intervalStr: String
-                if r.intervalType == .mileage, let mi = r.mileageInterval {
-                    intervalStr = "Every \(nf.string(from: NSNumber(value: mi)) ?? "\(mi)") \(vehicle.mileageUnit.label)"
-                } else if let freq = r.timeFrequency { intervalStr = freq.rawValue }
-                else { intervalStr = "—" }
-                let lastStr: String
-                if let d = r.lastCompletedDate { lastStr = df.string(from: d) }
-                else if let m = r.lastCompletedMileage {
-                    lastStr = "\(nf.string(from: NSNumber(value: m)) ?? "\(m)") \(vehicle.mileageUnit.label)"
-                } else { lastStr = "Never" }
-                let statusStr = due <= 0 ? "OVERDUE" : r.intervalType == .mileage
-                    ? "\(nf.string(from: NSNumber(value: due)) ?? "\(due)") \(vehicle.mileageUnit.label) left"
-                    : "Upcoming"
-                if needsBreak(18) { footerPageNum(); newPage(); tableHeader(sCols) }
-                tableRow([(r.title, 160, .left), (intervalStr, 110, .left), (lastStr, 120, .left), (statusStr, 142, .left)], idx: i, rowH: 18, redFlag: due <= 0)
+            if vehicle.reminders.isEmpty {
+                if needsBreak(16) { breakPage() }
+                let a: [NSAttributedString.Key: Any] = [.font: fBody, .foregroundColor: secondary]
+                ("No reminders scheduled." as NSString).draw(in: CGRect(x: margin, y: y, width: contentW, height: 16), withAttributes: a)
+                y += 22
+            } else {
+                let sorted = vehicle.reminders.sorted { reminderMilesUntilDue($0, currentMileage: vehicle.currentMileage) < reminderMilesUntilDue($1, currentMileage: vehicle.currentMileage) }
+                tableHeader(sCols)
+                for (i, r) in sorted.enumerated() {
+                    let due = reminderMilesUntilDue(r, currentMileage: vehicle.currentMileage)
+                    let intervalStr: String
+                    if r.intervalType == .mileage, let mi = r.mileageInterval {
+                        intervalStr = "Every \(nf.string(from: NSNumber(value: mi)) ?? "\(mi)") \(vehicle.mileageUnit.label)"
+                    } else if let freq = r.timeFrequency { intervalStr = freq.rawValue }
+                    else { intervalStr = "—" }
+                    let lastStr: String
+                    if let d = r.lastCompletedDate { lastStr = df.string(from: d) }
+                    else if let m = r.lastCompletedMileage {
+                        lastStr = "\(nf.string(from: NSNumber(value: m)) ?? "\(m)") \(vehicle.mileageUnit.label)"
+                    } else { lastStr = "Never" }
+                    let statusStr = due <= 0 ? "OVERDUE" : r.intervalType == .mileage
+                        ? "\(nf.string(from: NSNumber(value: due)) ?? "\(due)") \(vehicle.mileageUnit.label) left"
+                        : "Upcoming"
+                    if needsBreak(18) { footerPageNum(); newPage(); tableHeader(sCols) }
+                    tableRow([(r.title, 160, .left), (intervalStr, 110, .left), (lastStr, 120, .left), (statusStr, 142, .left)], idx: i, rowH: 18, redFlag: due <= 0)
+                }
             }
+            y += 12
         }
-        y += 12
 
         // ── MAINTENANCE HISTORY ──────────────────────────────────────────
-        if needsBreak(60) { footerPageNum(); newPage() }
-        sectionHeader("Maintenance History")
+        if includeLog {
+            if needsBreak(60) { footerPageNum(); newPage() }
+            sectionHeader("Maintenance History")
 
-        let notesColW: CGFloat = 188
-        let lCols: [Col] = [("Date", 74, .left), ("Service", 158, .left), ("Mileage", 70, .right), ("Cost", 62, .right), ("Notes", notesColW, .left)]
-        let logs = vehicle.maintenanceLogs.sorted { $0.date > $1.date }
+            let notesColW: CGFloat = includeCosts ? 188 : 250
+            let lCols: [Col] = includeCosts
+                ? [("Date", 74, .left), ("Service", 158, .left), ("Mileage", 70, .right), ("Cost", 62, .right), ("Notes", notesColW, .left)]
+                : [("Date", 74, .left), ("Service", 158, .left), ("Mileage", 70, .right), ("Notes", notesColW, .left)]
+            let logs = vehicle.maintenanceLogs.sorted { $0.date > $1.date }
 
-        if logs.isEmpty {
-            if needsBreak(16) { breakPage() }
-            let a: [NSAttributedString.Key: Any] = [.font: fBody, .foregroundColor: secondary]
-            ("No maintenance records yet." as NSString).draw(in: CGRect(x: margin, y: y, width: contentW, height: 16), withAttributes: a)
-            y += 16
-        } else {
-            func notesRowHeight(_ text: String) -> CGFloat {
-                guard !text.isEmpty else { return 18 }
-                let para = NSMutableParagraphStyle(); para.lineBreakMode = .byWordWrapping
-                let bounds = (text as NSString).boundingRect(
-                    with: CGSize(width: notesColW - 8, height: .greatestFiniteMagnitude),
-                    options: [.usesLineFragmentOrigin, .usesFontLeading],
-                    attributes: [.font: fBody, .paragraphStyle: para], context: nil)
-                return max(18, min(ceil(bounds.height) + 8, 72))
-            }
-            tableHeader(lCols)
-            for (i, log) in logs.enumerated() {
-                let notes = log.notes.replacingOccurrences(of: "• ", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
-                let rowH = notesRowHeight(notes)
-                if needsBreak(rowH) { footerPageNum(); newPage(); tableHeader(lCols) }
-                let mStr = vehicle.mileageUnit == .none ? "—" : (nf.string(from: NSNumber(value: log.mileage)) ?? "\(log.mileage)")
-                let cStr = log.totalCost > 0 ? String(format: "$%.2f", log.totalCost) : "—"
-                tableRow([(df.string(from: log.date), 74, .left), (log.serviceType, 158, .left), (mStr, 70, .right), (cStr, 62, .right), (notes, notesColW, .left)], idx: i, rowH: rowH)
+            if logs.isEmpty {
+                if needsBreak(16) { breakPage() }
+                let a: [NSAttributedString.Key: Any] = [.font: fBody, .foregroundColor: secondary]
+                ("No maintenance records yet." as NSString).draw(in: CGRect(x: margin, y: y, width: contentW, height: 16), withAttributes: a)
+                y += 16
+            } else {
+                func notesRowHeight(_ text: String) -> CGFloat {
+                    guard !text.isEmpty else { return 18 }
+                    let para = NSMutableParagraphStyle(); para.lineBreakMode = .byWordWrapping
+                    let bounds = (text as NSString).boundingRect(
+                        with: CGSize(width: notesColW - 8, height: .greatestFiniteMagnitude),
+                        options: [.usesLineFragmentOrigin, .usesFontLeading],
+                        attributes: [.font: fBody, .paragraphStyle: para], context: nil)
+                    return max(18, min(ceil(bounds.height) + 8, 72))
+                }
+                tableHeader(lCols)
+                for (i, log) in logs.enumerated() {
+                    let notes = log.notes.replacingOccurrences(of: "• ", with: "").trimmingCharacters(in: .whitespacesAndNewlines)
+                    let rowH = notesRowHeight(notes)
+                    if needsBreak(rowH) { footerPageNum(); newPage(); tableHeader(lCols) }
+                    let mStr = vehicle.mileageUnit == .none ? "—" : (nf.string(from: NSNumber(value: log.mileage)) ?? "\(log.mileage)")
+                    if includeCosts {
+                        let cStr = log.totalCost > 0 ? String(format: "$%.2f", log.totalCost) : "—"
+                        tableRow([(df.string(from: log.date), 74, .left), (log.serviceType, 158, .left), (mStr, 70, .right), (cStr, 62, .right), (notes, notesColW, .left)], idx: i, rowH: rowH)
+                    } else {
+                        tableRow([(df.string(from: log.date), 74, .left), (log.serviceType, 158, .left), (mStr, 70, .right), (notes, notesColW, .left)], idx: i, rowH: rowH)
+                    }
+                }
             }
         }
         footerPageNum()
     }
 
-    return PDFReport(name: "\(vehicle.displayName)_Report", data: pdfData)
+    let reportName: String
+    if includeSchedule && includeLog {
+        reportName = "\(vehicle.displayName)_Report"
+    } else if includeSchedule {
+        reportName = "\(vehicle.displayName)_Schedule"
+    } else {
+        reportName = "\(vehicle.displayName)_Log"
+    }
+
+    return PDFReport(name: reportName, data: pdfData)
 }
 #endif
 
